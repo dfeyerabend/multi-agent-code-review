@@ -30,7 +30,7 @@ LOCAL_TOOL_NAMES = {t["name"] for t in analyzer_local_tools}
 def convert_mcp_tools_to_anthropic(mcp_tools: list) -> list:
     """
     Converts MCP tool definitions to Anthropic's expected tool format.
-    MCP and Anthropic use slightly different schemas for tool definitions.
+    Needed because MCP and Anthropic use slightly different schemas for tool definitions.
     """
 
     anthropic_tools = []

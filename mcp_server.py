@@ -115,6 +115,12 @@ def _run_cli_tool(command: list[str]) -> dict:
         if result.returncode == 0:
             return {"status": "success", "data": []}  # clean run, no issues found
 
+        # fallback return for non-zero exit
+        return {
+            "status": "error",
+            "message": f"{tool_name} exited with code {result.returncode}: {result.stderr.strip() or 'no output'}"
+        }
+
     except FileNotFoundError:  # tool not installed or not in PATH
         tool_name = command[0]
         return {
@@ -124,7 +130,20 @@ def _run_cli_tool(command: list[str]) -> dict:
     except subprocess.TimeoutExpired:
         return {"status": "error", "message": "Tool timed out after 30 seconds"}
 
-
+# Help function to map ruff categories
+def _ruff_category(rule_code: str) -> str:
+    """Maps ruff rule prefixes to high-level categories."""
+    if rule_code.startswith("S"): # Currently not used because bandit handels security
+        return "Security"
+    if rule_code.startswith("E9"):
+        return "Logic"               # syntax errors
+    if rule_code.startswith(("F", "B")):
+        return "Logic"               # pyflakes + bugbear (likely bugs)
+    if rule_code.startswith("C"):
+        return "Maintainability"     # complexity
+    if rule_code.startswith(("E", "W")):
+        return "Style"
+    return "Style"                   # safe default
 
 def _ruff_severity(rule_code: str) -> str:
     """
@@ -176,12 +195,17 @@ def detect_syntax_errors(code: str) -> str:
 
         if ruff_result["status"] == "success" and "data" in ruff_result:
             for issue in ruff_result["data"]:  # each issue is a dict with code, message, location
+                rule_code  = issue.get("code", "unknown")
                 results["ruff"]["findings"].append({
-                    "rule": issue.get("code", "unknown"),
+                    "rule": rule_code ,
+                    "tool": "ruff",
                     "message": issue.get("message", ""),
                     "line": issue.get("location", {}).get("row"),
                     "column": issue.get("location", {}).get("column"),
-                    "severity": _ruff_severity(issue.get("code", ""))
+                    "severity": _ruff_severity(rule_code),
+                    "category": _ruff_category(rule_code),
+                    "doc_url": issue.get("url"),
+                    "fix_suggestion": issue.get("fix"),
                 })
 
             # only print details when there are actual findings
@@ -206,14 +230,20 @@ def detect_syntax_errors(code: str) -> str:
 
         if bandit_result["status"] == "success" and "data" in bandit_result:
             bandit_data = bandit_result["data"]
-            for issue in bandit_data.get("results", []):  # bandit nests findings under "results" key
+            for issue in bandit_data.get("results", []):
+                cwe = issue.get("issue_cwe") or {}
                 results["bandit"]["findings"].append({
-                    "test_id": issue.get("test_id", ""),
+                    "rule": issue.get("test_id", ""),  # umbenannt von test_id für Konsistenz
+                    "tool": "bandit",
                     "test_name": issue.get("test_name", ""),
                     "message": issue.get("issue_text", ""),
                     "line": issue.get("line_number"),
                     "severity": issue.get("issue_severity", "UNKNOWN"),
-                    "confidence": issue.get("issue_confidence", "UNKNOWN")
+                    "confidence": issue.get("issue_confidence", "UNKNOWN"),
+                    "category": "Security", # bandit is always "Security"
+                    "doc_url": issue.get("more_info"),
+                    "cwe_id": cwe.get("id"),
+                    "cwe_url": cwe.get("link"),
                 })
 
             # only print details when there are actual findings

@@ -23,6 +23,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 MCP_SERVER_PATH = os.path.join(PROJECT_ROOT, "mcp_server.py")   # path to the MCP server script
 
+CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "knowledge_base", "chroma_db") # path to the persistent ChromaDB storage folder
+
 
 # === AGENT SPECIFIC SYSTEM PROMPTS ===
 
