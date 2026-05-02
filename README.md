@@ -54,7 +54,7 @@ Code Input (file path or raw string)
 |---|---|---|
 | MCP Server (`mcp_server.py`) | ✅ Done | All code analysis tools, STDIO transport |
 | Analyzer Agent | ✅ Done | Connects to MCP, runs analysis, structured output via local tool |
-| ChromaDB + `knowledge_search` | 🔲 In Progress | RAG knowledge base for best practices |
+| ChromaDB + `knowledge_search` | ✅ Done | RAG knowledge base populated and ready |
 | Reviewer Agent | 🔲 In Progress | Classifies findings using RAG context |
 | Optimizer Agent | 🔲 In Progress | Generates fixes grounded in best practices |
 | Evaluator Agent | 🔲 In Progress | LLM-as-Judge scoring + final report |
@@ -91,12 +91,22 @@ The agent doesn't know which tools are remote and which are local. Routing happe
 
 ### RAG Knowledge Base
 
-ChromaDB stores Python best-practice documents:
-- PEP8 style guidelines
-- OWASP Top 10 for Python
-- Common performance anti-patterns
+ChromaDB stores two types of Python best-practice documents in a single collection (`code_best_practices`):
 
-Used by the Reviewer and Optimizer agents via the `knowledge_search` MCP tool. Chunk size: ~300 tokens. The agent decides when a RAG lookup is needed — not every finding requires one.
+**Google Python Style Guide (`pyguide`)** — covers naming conventions, imports, type annotations, exceptions, classes, and more. Goes beyond pure style into language patterns not caught by linters.
+Source: [google/styleguide](https://github.com/google/styleguide), license CC-BY 3.0.
+
+**example_company Code Standards (`company`)** — a set of fictional internal rules designed to demonstrate that the Reviewer Agent retrieves knowledge from the database rather than relying on pre-trained knowledge. Rules include required function naming prefixes for database operations, mandatory `# REASON:` comments, a custom exception hierarchy, and restricted config access patterns.
+
+Setup (run once after cloning):
+```bash
+python knowledge_base/create_database.py
+```
+
+Use `knowledge_base/inspect_database.py` to verify the database contents after setup.
+
+The agent decides when a RAG lookup is needed — not every finding requires one. 
+Chunks are filtered by category metadata (Style, Logic, Maintainability, Security) to keep retrieval focused.
 
 ### Evaluation
 
@@ -118,14 +128,20 @@ The Evaluator agent (LLM-as-Judge) scores the pipeline's output on five dimensio
 multi-agent-code-review/
 ├── agent/
 │   ├── __init__.py
-│   └── analyzer_agent.py       # Analyzer agent with MCP + local tool routing
+│   └── analyzer_agent.py           # Analyzer agent with MCP + local tool routing
+├── knowledge_base/
+│   ├── create_database.py          # Run once to populate ChromaDB from documents
+│   ├── inspect_database.py         # Dev utility to inspect database contents
+│   └── documents/
+│       ├── pyguide.md              # Google Python Style Guide (CC-BY 3.0)
+│       └── company_rules.md        # example_company internal coding standards
 ├── tools/
 │   ├── __init__.py
-│   └── analyzer_tools.py       # Local submit_analysis tool (schema + executor)
+│   └── analyzer_tools.py           # Local submit_analysis tool (schema + executor)
 ├── tests/
-│   └── test_mcp_tools.py       # MCP tool tests
-├── config.py                   # Global settings, model config, system prompts
-├── mcp_server.py               # MCP server with all code analysis tools
+│   └── test_mcp_tools.py           # MCP tool tests
+├── config.py                       # Global settings, model config, system prompts
+├── mcp_server.py                   # MCP server with all code analysis tools
 ├── requirements.txt
 ├── .env
 └── .gitignore
@@ -151,6 +167,9 @@ source .venv/bin/activate       # macOS/Linux
 .venv\Scripts\activate          # Windows
 
 pip install -r requirements.txt
+
+# Populate the RAG knowledge base (downloads embedding model on first run, ~90 MB)
+python knowledge_base/create_database.py
 ```
 
 ### Environment Setup

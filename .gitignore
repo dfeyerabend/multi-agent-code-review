@@ -7,7 +7,7 @@ build/
 .idea
 
 # ChromaDB
-faq_database/
+knowledge_base/chroma_db/
 *.sqlite3
 
 # Not published files
