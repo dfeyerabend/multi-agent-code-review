@@ -12,11 +12,12 @@ import subprocess
 import tempfile
 from mcp.server.fastmcp import FastMCP
 
+# Setup Logging
+import logging
+logger = logging.getLogger(__name__)
+
 # Prevents Unicode from crashing the code
 sys.stdout.reconfigure(encoding='utf-8')
-
-# Only for debugging
-from pprint import pprint
 
 mcp = FastMCP(
     "code-review-mcp",
@@ -34,14 +35,22 @@ def read_code(source: str) -> str:
 
     Args:
         source: Either a file path to a Python file, or a raw code string.
+
+    Returns:
+        JSON string with fields:
+        - status: "success" or "error"
+        - source_type: "file" or "raw_string"
+        - code: the full source code as a string
+        - line_count: number of lines in the code
+        - file_path: the resolved file path (only present for file input)
     """
-    print(f"\n[read_code] Received input: {source[:80]}...")
+    logger.debug("read_code input (first 80 chars): %s", source[:80])
     if os.path.isfile(source):
         try:
-            print(f"[read_code] -> Detected FILE path: {source}")
+            logger.debug("Detected file path: %s", source)
             with open(source, "r", encoding = f"utf-8") as f:
                 code = f.read()
-            print(f"[read_code] ✓ File read successfully ({len(code.splitlines())} lines)")
+            logger.info("File read successfully (%d lines)", len(code.splitlines()))
             return json.dumps({
                 "status": "success",
                 "source_type": "file",
@@ -50,14 +59,14 @@ def read_code(source: str) -> str:
                 "line_count": len(code.splitlines()), # useful for later agents
             }, indent = 2)
         except Exception as e:
-            print(f"[read_code] -> Failed to read file: {str(e)}")
+            logger.error("Failed to read file: %s", str(e))
             return json.dumps({
                 "status": "error",
                 "message": f"Failed to read file: {str(e)}",
             }, indent = 2)
 
     # If not a file path -> treat as raw string of code
-    print(f"[read_code] -> Detected RAW CODE string ({len(source.splitlines())} lines)")
+    logger.debug("Detected raw code string (%d lines)", len(source.splitlines()))
     return json.dumps({
         "status": "success",
         "source_type": "raw_string",
@@ -92,7 +101,7 @@ def _run_cli_tool(command: list[str]) -> dict:
     """
 
     tool_name = command[0]
-    print(f"  [{tool_name}] Executing: {' '.join(command[:4])}...")
+    logger.debug("Executing: %s", " ".join(command[:4]))
 
     try:
         result = subprocess.run(
@@ -102,7 +111,7 @@ def _run_cli_tool(command: list[str]) -> dict:
             timeout = 30,                           # fails if tool call does not work
         )
 
-        print(f"  [{tool_name}] Exit code: {result.returncode}")
+        logger.debug("%s exit code: %d", tool_name, result.returncode)
 
         # both ruff and bandit return JSON to stdout
         if result.stdout.strip():
@@ -172,13 +181,12 @@ def detect_syntax_errors(code: str) -> str:
     Args:
         code: Python source code as a string.
     """
-    print(f"\n[detect_syntax_errors] Received code ({len(code.splitlines())} lines)")
-    print(f"[detect_syntax_errors] Writing to temp file...")
+    logger.info("detect_syntax_errors called (%d lines)", len(code.splitlines()))
     tmp_path = _write_temp_file(code)                   # Always gets passed a code string, because read_code translates already into string
-    print(f"[detect_syntax_errors] Temp file: {tmp_path}")
+    logger.debug("Wrote temp file: %s", tmp_path)
 
     try:
-        print(f"[detect_syntax_errors] Running ruff (code quality)...")
+        logger.debug("Running ruff...")
         results = {
             "ruff": {"findings": [], "error": None},
             "bandit": {"findings": [], "error": None}
@@ -208,19 +216,18 @@ def detect_syntax_errors(code: str) -> str:
                     "fix_suggestion": issue.get("fix"),
                 })
 
-            # only print details when there are actual findings
+            # only report details when there are actual findings
             if results["ruff"]["findings"]:
-                print("\n" + "=" * 20 + "RUFF RESULTS" + "=" * 20)
-                pprint(results["ruff"]["findings"], width=120)
+                logger.debug("Ruff findings: %s", results["ruff"]["findings"])
 
-            print(f"[detect_syntax_errors] -> Ruff: {len(results['ruff']['findings'])} findings")
+            logger.info("Ruff: %d findings", len(results["ruff"]["findings"]))
 
         elif ruff_result["status"] == "error":
-            print(f"[detect_syntax_errors] Ruff code analysis failed: {ruff_result['message']}")
+            logger.warning("Ruff failed: %s", ruff_result["message"])
             results["ruff"]["error"] = ruff_result["message"]
 
         # --- Run bandit ---
-        print(f"[detect_syntax_errors] Running bandit (security)...")
+        logger.debug("Running bandit...")
         bandit_result = _run_cli_tool([
             "bandit",
             "-f", "json",  # structured JSON output
@@ -246,15 +253,14 @@ def detect_syntax_errors(code: str) -> str:
                     "cwe_url": cwe.get("link"),
                 })
 
-            # only print details when there are actual findings
+            # only report details when there are actual findings
             if results["bandit"]["findings"]:
-                print("\n" + "=" * 20 + "BANDIT RESULTS" + "=" * 20)
-                pprint(results["bandit"]["findings"], width=120)
+                logger.debug("Bandit findings: %s", results["bandit"]["findings"])
 
-            print(f"[detect_syntax_errors] -> Bandit: {len(results['bandit']['findings'])} findings")
+            logger.info("Bandit: %d findings", len(results["bandit"]["findings"]))
 
         elif bandit_result["status"] == "error":
-            print(f"[detect_syntax_errors] Bandit code analysis failed: {bandit_result['message']}")
+            logger.warning("Bandit failed: %s", bandit_result["message"])
             results["bandit"]["error"] = bandit_result["message"]
 
         # --- Summary ---
@@ -262,7 +268,7 @@ def detect_syntax_errors(code: str) -> str:
                 len(results["ruff"]["findings"])
                 + len(results["bandit"]["findings"])
         )
-        print(f"[detect_syntax_errors] ✓ Analysis complete: {total_findings} total findings")
+        logger.info("Analysis complete: %d total findings", total_findings)
 
         return json.dumps({
             "status": "clean" if total_findings == 0 else "issues_found",
@@ -287,7 +293,7 @@ def extract_code_structure(code: str) -> str:
         code: Python source code as a string.
     """
 
-    print(f"\n[extract_code_structure] Received code ({len(code.splitlines())} lines)")
+    logger.info("extract_code_structure called (%d lines)", len(code.splitlines()))
 
     # Fail fast
     try:
@@ -303,7 +309,7 @@ def extract_code_structure(code: str) -> str:
     classes = []
     imports = []
 
-    print(f"[extract_code_structure] Parsing AST...")
+    logger.debug("Parsing AST...")
 
     for node in ast.walk(tree):                                     # visit every node in the tree
         if isinstance(node, ast.FunctionDef):
@@ -347,15 +353,9 @@ def extract_code_structure(code: str) -> str:
                     "alias": alias.asname
                 })
 
-    ## DEBUG PRINT
-    print("\n" + "=" * 20 + "EXTRACT CODE RESULTS" + "=" * 20)
-    print("Functions:")
-    pprint(functions, width=120)
-    print("Classes:")
-    pprint(classes, width=120)
-    print("Imports:")
-    pprint(imports, width=120)
-    print("=" * 60 + "\n")
+    logger.debug("Functions: %s", functions)
+    logger.debug("Classes: %s", classes)
+    logger.debug("Imports: %s", imports)
 
     return json.dumps({
         "status": "success",
@@ -372,6 +372,9 @@ def extract_code_structure(code: str) -> str:
 
 # --- Start the server ---
 if __name__ == "__main__":
+    from config import setup_logging
+    setup_logging()                     # configure root logger once before server starts
+
     mcp.run(transport="stdio")
 
 

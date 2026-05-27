@@ -59,5 +59,23 @@ ANALYZER_PROMPT = (
     "- Do NOT suggest fixes. That is the Optimizer's job.\n"
 )
 
+# === LOGGING SETUP ===
+import logging
 
+# Read LOG_LEVEL from environment, default to INFO if not set.
+# Usage:
+#   LOG_LEVEL=DEBUG python agent/analyzer_agent.py   ← full detail
+#   python agent/analyzer_agent.py                   ← INFO only (default)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+def setup_logging() -> None:
+    """
+    Configure root logger once for the entire process.
+    Used in __main__ of every entrypoint script.
+    All module-level loggers inherit this config automatically.
+    """
+    logging.basicConfig(
+        level=LOG_LEVEL,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )

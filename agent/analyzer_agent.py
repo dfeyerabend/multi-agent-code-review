@@ -9,6 +9,9 @@ import json
 from mcp import ClientSession, StdioServerParameters       # MCP client SDK
 from mcp.client.stdio import stdio_client
 
+import logging
+logger = logging.getLogger(__name__)
+
 from config import (
     client,             # shared Anthropic client instance
     MODEL,
@@ -73,16 +76,15 @@ async def run_analyzer(code_input: str) -> dict:
             # Combine MCP tools + local tools into one list for Claude
             all_tools = mcp_tools + analyzer_local_tools
 
-            print(f"[Analyzer] Connected to MCP. Tools available:")
-            for t in all_tools:
-                source = "local" if t["name"] in LOCAL_TOOL_NAMES else "MCP"
-                print(f"  - {t['name']} ({source})")
+            # Log as a single summary line at INFO, full list at DEBUG
+            tool_summary = [f"{t['name']} ({'local' if t['name'] in LOCAL_TOOL_NAMES else 'MCP'})" for t in all_tools]
+            logger.info("Connected to MCP. Tools: %s", ", ".join(tool_summary))
 
             # --- Agent loop ---
             messages = [{"role": "user", "content": code_input}]
 
             for iteration in range(MAX_ITERATIONS):
-                print(f"\n[Analyzer] Iteration {iteration + 1}/{MAX_ITERATIONS}")
+                logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
 
                 response = client.messages.create(
                     model=MODEL,
@@ -92,12 +94,12 @@ async def run_analyzer(code_input: str) -> dict:
                     messages=messages,
                 )
 
-                print(f"[Analyzer] Stop reason: {response.stop_reason}")
+                logger.debug("Stop reason: %s", response.stop_reason)
 
                 # -- Analyzer is done
                 if response.stop_reason == "end_turn":
                     final_output = _extract_final_output(messages, response)
-                    print(f"[Analyzer] Completed after {iteration + 1} iteration(s)")
+                    logger.info("Completed after %d iteration(s)", iteration + 1)
                     return final_output
 
                 # --- Analyzer wants to use tools ---
@@ -107,33 +109,28 @@ async def run_analyzer(code_input: str) -> dict:
                     tool_results = []
                     for block in response.content:
                         if hasattr(block, "text") and block.text:
-                            print(f"[DEBUG] Claude says: {block.text[:200]}")
+                            logger.debug("Claude says: %s", block.text[:200])
                         if block.type == "tool_use":
-                            print(f"[DEBUG] Tool call: {block.name} with args: {str(block.input)[:200]}")
+                            logger.debug("Tool call: %s | args: %s", block.name, str(block.input)[:200])
 
                         if block.type == "tool_use":
                             tool_name = block.name
                             tool_args = block.input
 
-                            print(f"[Analyzer] Calling tool: {tool_name}", end="")
-
                             # Route: local tool or MCP tool?
                             if tool_name in LOCAL_TOOL_NAMES:
-                                print(" (local)")
+                                logger.debug("Calling tool: %s (local)", tool_name)
                                 tool_output = run_analyzer_tool(tool_name, tool_args)
                             else:
-                                print(" (MCP)")
+                                logger.debug("Calling tool: %s (MCP)", tool_name)
                                 try:
-                                    result = await session.call_tool(
-                                        tool_name,
-                                        arguments=tool_args,
-                                    )
+                                    result = await session.call_tool(tool_name, arguments=tool_args)
                                     tool_output = result.content[0].text if result.content else ""
                                 except Exception as e:
                                     tool_output = json.dumps({"status": "error", "message": str(e)})
-                                    print(f"[Analyzer] Tool error: {e}")
+                                    logger.warning("Tool error on %s: %s", tool_name, e)
 
-                            print(f"[DEBUG] Tool result for {tool_name}: {tool_output[:300]}")
+                            logger.debug("Tool result for %s: %s", tool_name, tool_output[:300])
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
@@ -143,7 +140,7 @@ async def run_analyzer(code_input: str) -> dict:
                     messages.append({"role": "user", "content": tool_results})
 
             # Max iterations reached
-            print(f"[Analyzer] WARNING: Reached max iterations ({MAX_ITERATIONS})")
+            logger.warning("Reached max iterations (%d)", MAX_ITERATIONS)
             return {"status": "error", "message": "Max iterations reached"}
 
 
@@ -175,13 +172,15 @@ def _extract_final_output(messages: list, final_response) -> dict:
     try:
         return json.loads(final_text)
     except json.JSONDecodeError:
-        print(f"[Analyzer] Failed to parse final output:")
+        logger.error("Failed to parse final output — raw: %s", final_text[:200])
         return {"status": "error", "raw_output": final_text}
 
 
 # --- Entry point for testing ---
 if __name__ == "__main__":
     import sys
+    from config import setup_logging
+    setup_logging()
 
     if len(sys.argv) > 1:
         test_input = sys.argv[1]  # e.g.: python analyzer_agent.py test_code.py
