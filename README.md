@@ -139,12 +139,47 @@ multi-agent-code-review/
 │   ├── __init__.py
 │   └── analyzer_tools.py           # Local submit_analysis tool (schema + executor)
 ├── tests/
-│   └── test_mcp_tools.py           # MCP tool tests
+│ ├── conftest.py                   # shared pytest fixtures (ChromaDB session)
+│ ├── test_mcp_tools.py             # MCP tool + helper function tests
+│ ├── test_analyzer_tools.py        # submit_analysis local tool tests
+│ └── test_rag_retrieval.py         # targeted RAG retrieval tests
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
 ├── requirements.txt
 ├── .env
 └── .gitignore
+```
+
+---
+
+## Testing
+
+Each component has a dedicated test file covering its deterministic logic.
+LLM agent behavior is not unit tested — it is non-deterministic and observed via logging instead.
+
+| Test File | What it covers |
+|---|---|
+| `tests/test_mcp_tools.py` | All MCP tool functions + severity/category helper functions |
+| `tests/test_analyzer_tools.py` | `submit_analysis` local tool — schema validation and error handling |
+| `tests/test_rag_retrieval.py` | ChromaDB retrieval — one targeted test per company rule, proving RAG context is active |
+
+```bash
+pytest                   # full suite
+pytest tests/test_rag_retrieval.py   # RAG tests only
+pytest -k "read_code"    # filter by name
+```
+---
+
+## Observability
+All agents and the MCP server use Python's `logging` module.
+Log verbosity is controlled by a single environment variable:
+| Level | Output |
+|---|---|
+| `INFO` (default) | Agent steps, tool calls, finding counts |
+| `DEBUG` | Full tool inputs and outputs for tracing the agent loop |
+```bash
+LOG_LEVEL=DEBUG python agent/analyzer_agent.py   # full trace
+python agent/analyzer_agent.py                   # clean output
 ```
 
 ---

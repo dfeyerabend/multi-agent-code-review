@@ -45,27 +45,37 @@ def read_code(source: str) -> str:
         - file_path: the resolved file path (only present for file input)
     """
     logger.debug("read_code input (first 80 chars): %s", source[:80])
-    if os.path.isfile(source):
-        try:
-            logger.debug("Detected file path: %s", source)
-            with open(source, "r", encoding = f"utf-8") as f:
-                code = f.read()
-            logger.info("File read successfully (%d lines)", len(code.splitlines()))
-            return json.dumps({
-                "status": "success",
-                "source_type": "file",
-                "file_path": source,
-                "code": code,
-                "line_count": len(code.splitlines()), # useful for later agents
-            }, indent = 2)
-        except Exception as e:
-            logger.error("Failed to read file: %s", str(e))
+
+    looks_like_path = "\n" not in source and source.strip().endswith(".py")
+
+    if looks_like_path:
+        if os.path.isfile(source):
+            try:
+                logger.debug("Detected file path: %s", source)
+                with open(source, "r", encoding = "utf-8") as f:
+                    code = f.read()
+                logger.info("File read successfully (%d lines)", len(code.splitlines()))
+                return json.dumps({
+                    "status": "success",
+                    "source_type": "file",
+                    "file_path": source,
+                    "code": code,
+                    "line_count": len(code.splitlines()), # useful for later agents
+                }, indent = 2)
+            except Exception as e:
+                logger.error("Failed to read file: %s", str(e))
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Failed to read file: {str(e)}",
+                }, indent = 2)
+        else:
+            logger.warning("File path provided but not found: %s", source)
             return json.dumps({
                 "status": "error",
-                "message": f"Failed to read file: {str(e)}",
-            }, indent = 2)
+                "message": f"File not found: {source}",
+            }, indent=2)
 
-    # If not a file path -> treat as raw string of code
+    # no .py extension or contains newlines → treat as raw code
     logger.debug("Detected raw code string (%d lines)", len(source.splitlines()))
     return json.dumps({
         "status": "success",
