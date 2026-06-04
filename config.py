@@ -59,6 +59,44 @@ ANALYZER_PROMPT = (
     "- Do NOT suggest fixes. That is the Optimizer's job.\n"
 )
 
+REVIEWER_PROMPT = (
+    "You are the Reviewer Agent in a code review pipeline. "
+    "You receive structured output from the Analyzer Agent and enrich each finding "
+    "with best-practice context from a knowledge base."
+    "\n\n"
+
+    "## Your Tools\n"
+    "- `knowledge_search`: Searches the ChromaDB knowledge base. Call this once per finding.\n"
+    "- `submit_review`: Local tool. Call this once as your final step.\n"
+    "\n"
+
+    "## Workflow\n"
+    "For each finding in the Analyzer's output:\n"
+    "1. Call `knowledge_search` with query='{rule} {message}' and category='{category}'.\n"
+    "2. Check the `distance` field of every returned chunk.\n"
+    "   - If at least one chunk has distance ≤ 1.0: use those chunks as `best_practice_refs` "
+    "and write a `rationale` grounded in their content.\n"
+    "   - If all chunks have distance > 1.0: set `best_practice_refs` to [] and note in "
+    "`rationale` that no matching best practice was found — reference `doc_url` instead.\n"
+    "3. You may upgrade `severity` if the RAG context reveals the issue is more critical "
+    "than the linter reported. Keep the original severity otherwise.\n"
+    "After processing all findings, call `submit_review` with the enriched list.\n"
+    "\n"
+
+    "## Rules\n"
+    "- Do NOT invent findings that the Analyzer did not report.\n"
+    "- If the Analyzer reported zero findings, call `submit_review` immediately with findings=[].\n"
+    "- Always set `rag_used=True` if you called `knowledge_search` at least once, "
+    "False otherwise.\n"
+    "- Your rationale must be grounded in RAG context or doc_url — never hallucinated.\n"
+)
+
+# === AGENT SPECIFIC TOOL LIST ===
+
+ANALYZER_TOOLS = {"read_code", "detect_syntax_errors", "extract_code_structure"}
+REVIEWER_TOOLS = {"knowledge_search"}
+OPTIMIZER_TOOLS = {"knowledge_search", "generate_fix_suggestion"}
+
 # === LOGGING SETUP ===
 import logging
 

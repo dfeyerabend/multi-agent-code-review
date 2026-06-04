@@ -1,73 +1,71 @@
 """
-Analyzer Agent — Step 1 in the Code Review Pipeline.
-Connects to the MCP server for code analysis tools,
-and uses a local submit_analysis tool for structured output.
+Reviewer Agent — Step 2 in the Code Review Pipeline.
+Receives Analyzer output, enriches each finding with RAG context via knowledge_search, and submits structured reviewed findings.
 """
 
 import asyncio
 import json
-from mcp import ClientSession, StdioServerParameters       # MCP client SDK
+from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from agent.agent_utils import convert_mcp_tools_to_anthropic
 
 import logging
 logger = logging.getLogger(__name__)
 
-from agent.agent_utils import convert_mcp_tools_to_anthropic
 from config import (
-    client,             # shared Anthropic client instance
+    client,
     MODEL,
     MAX_TOKENS,
     MAX_ITERATIONS,
     MCP_SERVER_PATH,
-    ANALYZER_PROMPT,
-    ANALYZER_TOOLS,
+    REVIEWER_PROMPT,
+    REVIEWER_TOOLS,
 )
 
-from tools.analyzer_tools import (
-    analyzer_local_tools,       # local tool schemas (submit_analysis)
-    run_analyzer_tool,          # local tool executor
+from tools.reviewer_tools import (
+    reviewer_local_tools,
+    run_reviewer_tool,
 )
 
-# --- Names of tools that run locally (not via MCP) ---
-LOCAL_TOOL_NAMES = {t["name"] for t in analyzer_local_tools}
+LOCAL_TOOL_NAMES = {t["name"] for t in reviewer_local_tools}
 
-
-
-async def run_analyzer(code_input: str) -> dict:
+async def run_reviewer(analyzer_output: dict) -> dict:
     """
-        Main function: connects to MCP, runs the Analyzer agent loop,
-        returns the structured analysis result.
+    Connects to MCP, runs the Reviewer agent loop, returns enriched findings.
 
-        Args:
-            code_input: Either a file path or a raw code string.
-        Returns:
-            dict with the structured analysis (or error info).
+    Args:
+        analyzer_output: The full dict returned by run_analyzer().
+
+    Returns:
+        dict with reviewed findings or error info.
     """
-
-    # --- Connect to MCP server via STDIO ---
     server_params = StdioServerParameters(
-        command="python",               # command to start the MCP server
-        args=[MCP_SERVER_PATH],         # path to our mcp_server.py
+        command="python",
+        args=[MCP_SERVER_PATH],
     )
 
-    async with stdio_client(server_params) as (read, write):    # open STDIO streams
-        async with ClientSession(read, write) as session:       # create MCP session
-            await session.initialize()                          # handshake with server
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
 
-            # --- Get tools from MCP server ---
             tools_result = await session.list_tools()
             mcp_tools = convert_mcp_tools_to_anthropic(tools_result.tools)
-            mcp_tools = [t for t in mcp_tools if t["name"] in ANALYZER_TOOLS]  # whitelist filter from config.py
+            mcp_tools = [t for t in mcp_tools if t["name"] in REVIEWER_TOOLS] # whitelist filter from config.py
+            all_tools = mcp_tools + reviewer_local_tools
 
-            # Combine MCP tools + local tools into one list for Claude
-            all_tools = mcp_tools + analyzer_local_tools
-
-            # Log as a single summary line at INFO, full list at DEBUG
-            tool_summary = [f"{t['name']} ({'local' if t['name'] in LOCAL_TOOL_NAMES else 'MCP'})" for t in all_tools]
+            tool_summary = [
+                f"{t['name']} ({'local' if t['name'] in LOCAL_TOOL_NAMES else 'MCP'})"
+                for t in all_tools
+            ]
             logger.info("Connected to MCP. Tools: %s", ", ".join(tool_summary))
 
-            # --- Agent loop ---
-            messages = [{"role": "user", "content": code_input}]
+            # Pass the Analyzer output as the user message
+            reviewer_input = analyzer_output.copy()
+            reviewer_input["analysis_results"] = {
+                k: v for k, v in analyzer_output["analysis_results"].items()
+                if k != "code"     # Remove code section as this is not relevant for the Reviewer agent
+            }
+            messages = [{"role": "user", "content": json.dumps(reviewer_input, indent=2)}]
 
             for iteration in range(MAX_ITERATIONS):
                 logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
@@ -75,20 +73,18 @@ async def run_analyzer(code_input: str) -> dict:
                 response = client.messages.create(
                     model=MODEL,
                     max_tokens=MAX_TOKENS,
-                    system=ANALYZER_PROMPT,
+                    system=REVIEWER_PROMPT,
                     tools=all_tools,
                     messages=messages,
                 )
 
                 logger.debug("Stop reason: %s", response.stop_reason)
 
-                # -- Analyzer is done
                 if response.stop_reason == "end_turn":
                     final_output = _extract_final_output(messages, response)
                     logger.info("Completed after %d iteration(s)", iteration + 1)
                     return final_output
 
-                # --- Analyzer wants to use tools ---
                 elif response.stop_reason == "tool_use":
                     messages.append({"role": "assistant", "content": response.content})
 
@@ -96,17 +92,15 @@ async def run_analyzer(code_input: str) -> dict:
                     for block in response.content:
                         if hasattr(block, "text") and block.text:
                             logger.debug("Claude says: %s", block.text[:200])
-                        if block.type == "tool_use":
-                            logger.debug("Tool call: %s | args: %s", block.name, str(block.input)[:200])
 
                         if block.type == "tool_use":
+                            logger.debug("Tool call: %s | args: %s", block.name, str(block.input)[:200])
                             tool_name = block.name
                             tool_args = block.input
 
-                            # Route: local tool or MCP tool?
                             if tool_name in LOCAL_TOOL_NAMES:
                                 logger.debug("Calling tool: %s (local)", tool_name)
-                                tool_output = run_analyzer_tool(tool_name, tool_args)
+                                tool_output = run_reviewer_tool(tool_name, tool_args)
                             else:
                                 logger.debug("Calling tool: %s (MCP)", tool_name)
                                 try:
@@ -125,31 +119,32 @@ async def run_analyzer(code_input: str) -> dict:
 
                     messages.append({"role": "user", "content": tool_results})
 
-            # Max iterations reached
             logger.warning("Reached max iterations (%d)", MAX_ITERATIONS)
             return {"status": "error", "message": "Max iterations reached"}
 
 
 def _extract_final_output(messages: list, final_response) -> dict:
     """
-    Extracts the structured analysis from the conversation.
-    Prefers the submit_analysis tool result over raw text output,
-    because the tool enforces the correct schema.
-    """
+    Extracts the submit_review result from the conversation history.
 
-    # Look backwards through messages for the last submit_analysis result
+    Args:
+        messages:       Full conversation message list.
+        final_response: The last response object from the Anthropic API.
+
+    Returns:
+        dict containing the validated review output, or error info.
+    """
     for msg in reversed(messages):
         if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-            for block in msg["content"]:  # iterate tool_result blocks
+            for block in msg["content"]:
                 if block.get("type") == "tool_result":
                     try:
                         result = json.loads(block["content"])
-                        if result.get("status") == "success" and "analysis_results" in result:
-                            return result  # found the submit_analysis output
+                        if result.get("status") == "success" and "review_results" in result:  # reviewer-specific key
+                            return result
                     except (json.JSONDecodeError, TypeError):
                         continue
 
-    # Fallback: try to parse text from final response
     final_text = ""
     for block in final_response.content:
         if hasattr(block, "text"):
@@ -162,34 +157,35 @@ def _extract_final_output(messages: list, final_response) -> dict:
         return {"status": "error", "raw_output": final_text}
 
 
-# --- Entry point for testing ---
 if __name__ == "__main__":
-    import sys
     from config import setup_logging
     setup_logging()
 
-    if len(sys.argv) > 1:
-        test_input = sys.argv[1]  # e.g.: python analyzer_agent.py test_code.py
-    else:
-        # Default test: SQL injection + missing docstring + unused import
-        test_input = (
-            "import os, sys\n"
-            "import json\n"
-            "def get_user(id):\n"
-            "    query = 'SELECT * FROM users WHERE id = ' + id\n"
-            "    return query\n"
-        )
+    # Default test: pipe in a realistic Analyzer output
+    test_analyzer_output = {
+        "status": "success",
+        "analysis_results": {
+            "file_path": None,
+            "line_count": 4,
+            "syntax_findings": [
+                {"rule": "F401", "message": "`os` imported but unused", "line": 1, "severity": "HIGH", "category": "Logic", "doc_url": "https://docs.astral.sh/ruff/rules/unused-import"}
+            ],
+            "security_findings": [
+                {"rule": "B608", "message": "Possible SQL injection via string-based query construction", "line": 3, "severity": "HIGH", "category": "Security", "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html", "cwe_id": 89, "cwe_url": "https://cwe.mitre.org/data/definitions/89.html"}
+            ],
+            "structure": {"functions": [{"name": "get_user", "line": 2, "args": ["id"], "has_docstring": False}], "classes": [], "imports": [{"module": "os", "alias": None}]},
+            "summary": "Two findings: one unused import and one SQL injection risk.",
+        },
+        "metadata": {"total_syntax_findings": 1, "total_security_findings": 1, "total_findings": 2},
+    }
 
     print("=" * 60)
-    print("ANALYZER AGENT — TEST RUN")
+    print("REVIEWER AGENT — TEST RUN")
     print("=" * 60)
 
-    result = asyncio.run(run_analyzer(test_input))
+    result = asyncio.run(run_reviewer(test_analyzer_output))
 
     print("\n" + "=" * 60)
     print("FINAL OUTPUT:")
     print("=" * 60)
     print(json.dumps(result, indent=2))
-
-
-
