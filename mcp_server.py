@@ -379,6 +379,72 @@ def extract_code_structure(code: str) -> str:
         }
     }, indent=2)
 
+# --- TOOL 4: Knowledge Search (RAG) ---
+@mcp.tool()
+def knowledge_search(query: str, category: str = "", n_results: int = 3) -> str:
+    """
+   Searches the ChromaDB knowledge base for best-practice context.
+
+   Args:
+       query:     Natural language search string, typically rule code + message.
+       category:  Optional metadata filter — "Style", "Logic", "Maintainability", or "Security".
+       n_results: Number of chunks to return (default 3).
+
+   Returns:
+       JSON string with a list of matching chunks, each containing text,
+       source, section, category, and relevance distance.
+   """
+    import chromadb
+    from config import CHROMA_DB_PATH
+
+    logger.info("knowledge_search called | query: %s | category: %s", query, category)
+
+    try:
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)         # connect to the on-disk ChromaDB store
+        collection = client.get_collection("code_best_practices")
+
+        query_kwargs = {
+            "query_texts": [query],
+            "n_results": n_results,                                     # N of chunks returned
+            "include": ["documents", "metadatas", "distances"],         # include in addition to ID
+        }
+
+        if category:                                                    # only filter when caller provides a value — empty where={} crashes ChromaDB
+            query_kwargs["where"] = {"category": category}
+
+        results = collection.query(**query_kwargs)
+
+        chunks = []
+        documents = results.get("documents", [[]])[0]                   # ChromaDB returns nested lists — [0] unwraps the single-query layer
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        for doc, meta, dist in zip(documents, metadatas, distances):    # zip pairs each document with its matching metadata and distance by position
+            chunks.append({
+                "text": doc,
+                "source": meta.get("source"),
+                "section": meta.get("section"),
+                "category": meta.get("category"),
+                "distance": round(dist, 4),                             # rounded for readability in logs and agent context
+            })
+
+        logger.info("knowledge_search: %d chunks returned", len(chunks))
+        logger.debug("knowledge_search results: %s", chunks)
+
+        return json.dumps({
+            "status": "success",
+            "query": query,
+            "category_filter": category or None,
+            "results": chunks,
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("knowledge_search failed: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": str(e),
+        }, indent=2)
+
 
 # --- Start the server ---
 if __name__ == "__main__":

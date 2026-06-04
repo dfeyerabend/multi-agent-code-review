@@ -7,7 +7,7 @@ import json
 import os
 import pytest
 
-from mcp_server import read_code, detect_syntax_errors, extract_code_structure, _ruff_severity, _ruff_category
+from mcp_server import read_code, detect_syntax_errors, extract_code_structure, _ruff_severity, _ruff_category, knowledge_search
 
 # Absolute path to mcp_server.py — used as a real file input in read_code tests.
 # os.path.dirname(__file__) is the tests/ folder, so we go one level up.
@@ -140,3 +140,40 @@ def test_ruff_severity(rule_code, expected):
 def test_ruff_category(rule_code, expected):
     """Maps ruff rule prefixes to the correct category label."""
     assert _ruff_category(rule_code) == expected
+
+
+# ── knowledge_search ──────────────────────────────────────────────────────────
+
+def test_knowledge_search_returns_results_with_category(chroma_collection):
+    """Returns at least one result when querying with a valid category filter."""
+    result = json.loads(knowledge_search("unused import", category="Logic"))
+
+    assert result["status"] == "success"
+    assert len(result["results"]) > 0
+
+def test_knowledge_search_returns_results_without_category(chroma_collection):
+    """Returns results when no category filter is provided."""
+    result = json.loads(knowledge_search("security exception handling"))
+
+    assert result["status"] == "success"
+    assert len(result["results"]) > 0
+
+def test_knowledge_search_result_shape(chroma_collection):
+    """Every returned chunk contains the required fields."""
+    result = json.loads(knowledge_search("naming convention", category="Style"))
+
+    for chunk in result["results"]:
+        assert "text" in chunk
+        assert "source" in chunk
+        assert "section" in chunk
+        assert "category" in chunk
+        assert "distance" in chunk
+
+def test_knowledge_search_nonsense_query_does_not_crash(chroma_collection):
+    """ChromaDB returns nearest matches even for a meaningless query — no exception."""
+    result = json.loads(knowledge_search("xqzjwplm12345"))
+
+    assert result["status"] == "success"                            # closest match returned, not an error
+    for chunk in result["results"]:
+        assert chunk["distance"] > 1.0                              # no real match — all results are semantically distant
+
