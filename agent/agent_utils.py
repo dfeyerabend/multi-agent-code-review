@@ -1,5 +1,6 @@
 """
 Shared utilities for all agents in the Code Review pipeline.
+Includes MCP tool format conversion and list chunking for batched agent runs.
 """
 
 
@@ -21,3 +22,16 @@ def convert_mcp_tools_to_anthropic(mcp_tools: list) -> list:
         }
         for tool in mcp_tools
     ]
+
+def chunk_list(items: list, size: int) -> list[list]:
+    """
+    Splits a list into successive sublists of at most `size` items.
+
+    Args:
+        items: The list to split.
+        size:  Maximum number of items per chunk.
+
+    Returns:
+        List of sublists. If items is empty, returns an empty list.
+    """
+    return [items[i : i + size] for i in range(0, len(items), size)]

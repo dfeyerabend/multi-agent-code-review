@@ -55,9 +55,10 @@ Code Input (file path or raw string)
 | MCP Server (`mcp_server.py`) | ✅ Done | All code analysis tools, STDIO transport |
 | Analyzer Agent | ✅ Done | Connects to MCP, runs analysis, structured output via local tool |
 | ChromaDB + `knowledge_search` | ✅ Done | RAG knowledge base populated and ready |
-| Enricher Agent | ✅ Done | Classifies findings using RAG context |
-| Optimizer Agent | 🔲 In Progress | Generates fixes grounded in best practices |
-| Evaluator Agent | 🔲 In Progress | LLM-as-Judge scoring + final report |
+| Enricher Agent | ✅ Done | Enriches findings with RAG context; batched to prevent context overflow |
+| Orchestrator | ✅ Done | Linear pipeline driver; owns pipeline state; builds per-agent input contracts |
+| Optimizer Agent | 🔲 Pending | Generates fixes grounded in best practices |
+| Evaluator Agent | 🔲 Pending | LLM-as-Judge scoring + final report |
 | Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes |
 
 ---
@@ -130,28 +131,30 @@ The Evaluator agent (LLM-as-Judge) scores the pipeline's output on five dimensio
 ```
 multi-agent-code-review/
 ├── agent/
-│   ├── __init__.py
-│   ├── agent_utils.py          # Shared utilities (MCP tool format conversion)
-│   ├── analyzer_agent.py       # Analyzer agent
-│   └── enricher_agent.py       # Enricher agent
+│ ├── init.py
+│ ├── agent_utils.py                # Shared utilities (MCP tool format conversion, chunking)
+│ ├── analyzer_agent.py             # Analyzer agent
+│ └── enricher_agent.py             # Enricher agent (batched)
 ├── knowledge_base/
-│   ├── create_database.py          # Run once to populate ChromaDB from documents
-│   ├── inspect_database.py         # Dev utility to inspect database contents
-│   └── documents/
-│       ├── pyguide.md              # Google Python Style Guide (CC-BY 3.0)
-│       └── company_rules.md        # example_company internal coding standards
+│ ├── create_database.py            # Run once to populate ChromaDB from documents
+│ ├── inspect_database.py           # Dev utility to inspect database contents
+│ └── documents/
+│ ├── pyguide.md                    # Google Python Style Guide (CC-BY 3.0)
+│ └── company_rules.md              # example_company internal coding standards
 ├── tools/
-│   ├── __init__.py
-│   ├── analyzer_tools.py       # Local submit_analysis tool
-│   └── enricher_tools.py       # Local submit_enrichment tool
+│ ├── init.py
+│ ├── analyzer_tools.py             # Local submit_analysis tool
+│ └── enricher_tools.py             # Local submit_enrichment tool
 ├── tests/
-│   ├── conftest.py
-│   ├── test_mcp_tools.py       # MCP tools + knowledge_search tests
-│   ├── test_analyzer_tools.py  # submit_analysis tests incl. deduplication
-│   ├── test_enricher_tools.py  # submit_enrichment schema validation tests
-│   └── test_rag_retrieval.py
+│ ├── conftest.py
+│ ├── test_mcp_tools.py             # MCP tools + knowledge_search tests
+│ ├── test_analyzer_tools.py        # submit_analysis tests incl. deduplication
+│ ├── test_enricher_tools.py        # submit_enrichment schema validation tests
+│ ├── test_agent_utils.py           # chunk_list utility tests
+│ └── test_rag_retrieval.py
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
+├── orchestrator.py                 # Pipeline driver — Analyzer → Enricher → (Optimizer stub)
 ├── requirements.txt
 ├── .env
 └── .gitignore
@@ -233,13 +236,16 @@ ANTHROPIC_API_KEY=sk-ant-...
 ### Usage
 
 ```bash
-# Run with default test code (SQL injection example)
-python agent/analyzer_agent.py
+# Run the full pipeline (recommended)
+python orchestrator.py
 
 # Run with a specific file
-python agent/analyzer_agent.py path/to/your_code.py
-```
+python orchestrator.py path/to/your_code.py
 
+# Run individual agents standalone
+python agent/analyzer_agent.py
+python agent/enricher_agent.py
+```
 ---
 
 ## Tech Stack

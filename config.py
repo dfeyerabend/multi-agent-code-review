@@ -96,6 +96,9 @@ ANALYZER_TOOLS = {"read_code", "detect_syntax_errors", "extract_code_structure"}
 ENRICHER_TOOLS = {"knowledge_search"}
 OPTIMIZER_TOOLS = {"knowledge_search", "generate_fix_suggestion"}
 
+ENRICHER_BATCH_SIZE = 5     # findings per Enricher batch
+OPTIMIZER_BATCH_SIZE = 3    # work items per Optimizer batch (smaller — carries function source)
+
 # === LOGGING SETUP ===
 import logging
 
