@@ -1,6 +1,6 @@
 """
-Local tools for the Reviewer Agent.
-submit_review enforces the output schema so the Optimizer always receives consistent findings.
+Local tools for the Enricher Agent.
+submit_enrichment enforces the output schema so the Optimizer always receives consistent findings.
 """
 
 import json
@@ -16,7 +16,7 @@ _best_practice_ref_schema = {           # one RAG chunk cited as evidence
     },
 }
 
-_reviewed_finding_schema = {                        # one fully enriched finding
+_enriched_finding_schema = {                        # one fully enriched finding
     "type": "object",
     "properties": {
         "rule":     {"type": "string"},             # original ruff/bandit rule code, e.g. "B301"
@@ -35,9 +35,9 @@ _reviewed_finding_schema = {                        # one fully enriched finding
 
 # === TOOL DEFINITION ===
 
-reviewer_local_tools = [
+enricher_local_tools = [
     {
-        "name": "submit_review",
+        "name": "submit_enrichment",
         "description": (
             "Submit the final reviewed findings after classifying every issue "
             "from the Analyzer's output. Call knowledge_search for each finding "
@@ -53,7 +53,7 @@ reviewer_local_tools = [
                         "One entry per finding from the Analyzer. "
                         "Empty list if the Analyzer reported no issues."
                     ),
-                    "items": _reviewed_finding_schema,
+                    "items": _enriched_finding_schema,
                 },
                 "summary": {
                     "type": "string",
@@ -71,7 +71,7 @@ reviewer_local_tools = [
 
 # === TOOL EXECUTION ===
 
-def run_reviewer_tool(name: str, tool_input: dict) -> str:
+def run_enricher_tool(name: str, tool_input: dict) -> str:
     """
     Executes local reviewer tools by name.
 
@@ -82,7 +82,7 @@ def run_reviewer_tool(name: str, tool_input: dict) -> str:
     Returns:
         JSON string with status and validated review data, or an error message.
     """
-    if name == "submit_review":
+    if name == "submit_enrichment":
         try:
             required_fields = ["findings", "summary", "rag_used"]
             missing = [f for f in required_fields if f not in tool_input]   # checks for all required fields in tool_input
@@ -100,7 +100,7 @@ def run_reviewer_tool(name: str, tool_input: dict) -> str:
 
             return json.dumps({
                 "status": "success",
-                "review_results": tool_input,
+                "enrichment_results": tool_input,
                 "metadata": {
                     "total_reviewed_findings": len(tool_input["findings"]),
                     "rag_used": tool_input["rag_used"],
@@ -110,7 +110,7 @@ def run_reviewer_tool(name: str, tool_input: dict) -> str:
         except Exception as e:
             return json.dumps({
                 "status": "error",
-                "message": f"submit_review failed: {str(e)}",
+                "message": f"submit_enrichment failed: {str(e)}",
             })
 
     else:

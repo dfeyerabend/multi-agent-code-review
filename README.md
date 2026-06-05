@@ -8,7 +8,7 @@
 
 An automated code review system where specialized agents work in sequence:
 
-**Read code → Analyze issues → Review & classify → Generate fixes → Evaluate improvements**
+**Read code → Analyze issues → Enrich with context → Generate fixes → Evaluate improvements**
 
 Each agent has a single responsibility and communicates structured data to the next. All code analysis tools are exposed through a single MCP server that agents discover dynamically at runtime.
 
@@ -24,8 +24,8 @@ Code Input (file path or raw string)
              │ structured JSON
              ▼
 ┌───────────────────────────┐
-│      Reviewer Agent       │  ← MCP tools: knowledge_search (RAG)
-│  Enrich findings with     │  ← Local tool: submit_review (structured output)
+│      Enricher Agent       │  ← MCP tools: knowledge_search (RAG)
+│  Enrich findings with     │  ← Local tool: submit_enrichment (structured output)
 │  best-practice context    │
 └────────────┬──────────────┘
              │ structured JSON
@@ -55,7 +55,7 @@ Code Input (file path or raw string)
 | MCP Server (`mcp_server.py`) | ✅ Done | All code analysis tools, STDIO transport |
 | Analyzer Agent | ✅ Done | Connects to MCP, runs analysis, structured output via local tool |
 | ChromaDB + `knowledge_search` | ✅ Done | RAG knowledge base populated and ready |
-| Reviewer Agent | ✅ Done | Classifies findings using RAG context |
+| Enricher Agent | ✅ Done | Classifies findings using RAG context |
 | Optimizer Agent | 🔲 In Progress | Generates fixes grounded in best practices |
 | Evaluator Agent | 🔲 In Progress | LLM-as-Judge scoring + final report |
 | Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes |
@@ -99,7 +99,7 @@ ChromaDB stores two types of Python best-practice documents in a single collecti
 **Google Python Style Guide (`pyguide`)** — covers naming conventions, imports, type annotations, exceptions, classes, and more. Goes beyond pure style into language patterns not caught by linters.
 Source: [google/styleguide](https://github.com/google/styleguide), license CC-BY 3.0.
 
-**example_company Code Standards (`company`)** — a set of fictional internal rules designed to demonstrate that the Reviewer Agent retrieves knowledge from the database rather than relying on pre-trained knowledge. Rules include required function naming prefixes for database operations, mandatory `# REASON:` comments, a custom exception hierarchy, and restricted config access patterns.
+**example_company Code Standards (`company`)** — a set of fictional internal rules designed to demonstrate that the Enricher Agent retrieves knowledge from the database rather than relying on pre-trained knowledge. Rules include required function naming prefixes for database operations, mandatory `# REASON:` comments, a custom exception hierarchy, and restricted config access patterns.
 
 Setup (run once after cloning):
 ```bash
@@ -133,7 +133,7 @@ multi-agent-code-review/
 │   ├── __init__.py
 │   ├── agent_utils.py          # Shared utilities (MCP tool format conversion)
 │   ├── analyzer_agent.py       # Analyzer agent
-│   └── reviewer_agent.py       # Reviewer agent
+│   └── enricher_agent.py       # Enricher agent
 ├── knowledge_base/
 │   ├── create_database.py          # Run once to populate ChromaDB from documents
 │   ├── inspect_database.py         # Dev utility to inspect database contents
@@ -143,12 +143,12 @@ multi-agent-code-review/
 ├── tools/
 │   ├── __init__.py
 │   ├── analyzer_tools.py       # Local submit_analysis tool
-│   └── reviewer_tools.py       # Local submit_review tool
+│   └── enricher_tools.py       # Local submit_enrichment tool
 ├── tests/
 │   ├── conftest.py
 │   ├── test_mcp_tools.py       # MCP tools + knowledge_search tests
 │   ├── test_analyzer_tools.py  # submit_analysis tests incl. deduplication
-│   ├── test_reviewer_tools.py  # submit_review schema validation tests
+│   ├── test_enricher_tools.py  # submit_enrichment schema validation tests
 │   └── test_rag_retrieval.py
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
@@ -169,7 +169,7 @@ LLM agent behavior is not unit tested — it is non-deterministic and observed v
 | `tests/test_mcp_tools.py` | All MCP tool functions + severity/category helper functions |
 | `tests/test_analyzer_tools.py` | `submit_analysis` local tool — schema validation and error handling |
 | `tests/test_rag_retrieval.py` | ChromaDB retrieval — one targeted test per company rule, proving RAG context is active |
-| `tests/test_reviewer_tools.py` | submit_review local tool — schema validation, empty findings, type guards |
+| `tests/test_enricher_tools.py` | submit_enrichment local tool — schema validation, empty findings, type guards |
 
 ```bash
 pytest                   # full suite
@@ -190,8 +190,8 @@ Log verbosity is controlled by a single environment variable:
 ```bash
 LOG_LEVEL=DEBUG python agent/analyzer_agent.py   # full trace
 python agent/analyzer_agent.py                   # clean output
-LOG_LEVEL=DEBUG python agent/reviewer_agent.py   # full trace
-python agent/reviewer_agent.py                   # clean output
+LOG_LEVEL=DEBUG python agent/enricher_agent.py   # full trace
+python agent/enricher_agent.py                   # clean output
 ```
 
 ---

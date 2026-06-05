@@ -1,6 +1,6 @@
 """
-Reviewer Agent — Step 2 in the Code Review Pipeline.
-Receives Analyzer output, enriches each finding with RAG context via knowledge_search, and submits structured reviewed findings.
+Enricher Agent — Step 2 in the Code Review Pipeline.
+Receives Analyzer output, enriches each finding with RAG context via knowledge_search, and submits structured enriched findings.
 """
 
 import asyncio
@@ -18,18 +18,18 @@ from config import (
     MAX_TOKENS,
     MAX_ITERATIONS,
     MCP_SERVER_PATH,
-    REVIEWER_PROMPT,
-    REVIEWER_TOOLS,
+    ENRICHER_PROMPT,
+    ENRICHER_TOOLS,
 )
 
-from tools.reviewer_tools import (
-    reviewer_local_tools,
-    run_reviewer_tool,
+from tools.enricher_tools import (
+    enricher_local_tools,
+    run_enricher_tool,
 )
 
-LOCAL_TOOL_NAMES = {t["name"] for t in reviewer_local_tools}
+LOCAL_TOOL_NAMES = {t["name"] for t in enricher_local_tools}
 
-async def run_reviewer(analyzer_output: dict) -> dict:
+async def run_enricher(analyzer_output: dict) -> dict:
     """
     Connects to MCP, runs the Reviewer agent loop, returns enriched findings.
 
@@ -50,8 +50,8 @@ async def run_reviewer(analyzer_output: dict) -> dict:
 
             tools_result = await session.list_tools()
             mcp_tools = convert_mcp_tools_to_anthropic(tools_result.tools)
-            mcp_tools = [t for t in mcp_tools if t["name"] in REVIEWER_TOOLS] # whitelist filter from config.py
-            all_tools = mcp_tools + reviewer_local_tools
+            mcp_tools = [t for t in mcp_tools if t["name"] in ENRICHER_TOOLS] # whitelist filter from config.py
+            all_tools = mcp_tools + enricher_local_tools
 
             tool_summary = [
                 f"{t['name']} ({'local' if t['name'] in LOCAL_TOOL_NAMES else 'MCP'})"
@@ -60,12 +60,12 @@ async def run_reviewer(analyzer_output: dict) -> dict:
             logger.info("Connected to MCP. Tools: %s", ", ".join(tool_summary))
 
             # Pass the Analyzer output as the user message
-            reviewer_input = analyzer_output.copy()
-            reviewer_input["analysis_results"] = {
+            enricher_input = analyzer_output.copy()
+            enricher_input["analysis_results"] = {
                 k: v for k, v in analyzer_output["analysis_results"].items()
                 if k != "code"     # Remove code section as this is not relevant for the Reviewer agent
             }
-            messages = [{"role": "user", "content": json.dumps(reviewer_input, indent=2)}]
+            messages = [{"role": "user", "content": json.dumps(enricher_input, indent=2)}]
 
             for iteration in range(MAX_ITERATIONS):
                 logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
@@ -73,7 +73,7 @@ async def run_reviewer(analyzer_output: dict) -> dict:
                 response = client.messages.create(
                     model=MODEL,
                     max_tokens=MAX_TOKENS,
-                    system=REVIEWER_PROMPT,
+                    system=ENRICHER_PROMPT,
                     tools=all_tools,
                     messages=messages,
                 )
@@ -100,7 +100,7 @@ async def run_reviewer(analyzer_output: dict) -> dict:
 
                             if tool_name in LOCAL_TOOL_NAMES:
                                 logger.debug("Calling tool: %s (local)", tool_name)
-                                tool_output = run_reviewer_tool(tool_name, tool_args)
+                                tool_output = run_enricher_tool(tool_name, tool_args)
                             else:
                                 logger.debug("Calling tool: %s (MCP)", tool_name)
                                 try:
@@ -125,7 +125,7 @@ async def run_reviewer(analyzer_output: dict) -> dict:
 
 def _extract_final_output(messages: list, final_response) -> dict:
     """
-    Extracts the submit_review result from the conversation history.
+    Extracts the submit_enrichment result from the conversation history.
 
     Args:
         messages:       Full conversation message list.
@@ -140,7 +140,7 @@ def _extract_final_output(messages: list, final_response) -> dict:
                 if block.get("type") == "tool_result":
                     try:
                         result = json.loads(block["content"])
-                        if result.get("status") == "success" and "review_results" in result:  # reviewer-specific key
+                        if result.get("status") == "success" and "enrichment_results" in result:  # reviewer-specific key
                             return result
                     except (json.JSONDecodeError, TypeError):
                         continue
@@ -180,10 +180,10 @@ if __name__ == "__main__":
     }
 
     print("=" * 60)
-    print("REVIEWER AGENT — TEST RUN")
+    print("ENRICHER AGENT — TEST RUN")
     print("=" * 60)
 
-    result = asyncio.run(run_reviewer(test_analyzer_output))
+    result = asyncio.run(run_enricher(test_analyzer_output))
 
     print("\n" + "=" * 60)
     print("FINAL OUTPUT:")

@@ -2,7 +2,7 @@
 Local tools for the Analyzer Agent.
 These are NOT on the MCP server — they run locally in the agent process.
 The submit_analysis tool enforces a strict output schema so the
-Reviewer agent always gets consistent, structured input.
+Enricher agent always gets consistent, structured input.
 """
 
 import json
@@ -184,7 +184,7 @@ def run_analyzer_tool(name: str, tool_input: dict) -> str:
                 })
 
             # Deduplicate issues -> each issue becomes one entry with multiple associated code lines
-            # Done so that the Reviewer does only one RAG lookup per rule, not per occurrence
+            # Done so that the Enricher does only one RAG lookup per rule, not per occurrence
             deduped_syntax = _deduplicate_findings(tool_input.get("syntax_findings", []))
             deduped_security = _deduplicate_findings(tool_input.get("security_findings", []))
 
