@@ -134,6 +134,31 @@ analyzer_local_tools = [
     }
 ]
 
+# === HELPER FUNCTIONS ===
+
+def _deduplicate_findings(findings: list) -> list:
+    """
+    Collapses findings with the same rule code into a single entry.
+
+    Args:
+        findings: List of finding dicts from ruff or bandit.
+
+    Returns:
+        Deduplicated list where each rule code appears once,
+        with all affected line numbers collected under 'lines'
+        and a count under 'occurrences'.
+    """
+    seen = {}
+    for finding in findings:
+        rule = finding.get("rule", "unknown")
+        if rule not in seen:
+            seen[rule] = {**finding, "lines": [finding.get("line")], "occurrences": 1}
+            seen[rule].pop("line", None)     # replace single 'line' with 'lines' list
+        else:
+            seen[rule]["lines"].append(finding.get("line"))
+            seen[rule]["occurrences"] += 1
+    return list(seen.values())
+
 # === TOOL EXECUTION ===
 def run_analyzer_tool(name: str, tool_input: dict) -> str:
     """
@@ -158,18 +183,20 @@ def run_analyzer_tool(name: str, tool_input: dict) -> str:
                     "message": f"Missing required fields: {missing}",
                 })
 
-            # Count total findings for a quick summary
-            total_syntax = len(tool_input.get("syntax_findings", []))
-            total_security = len(tool_input.get("security_findings", []))
+            # Deduplicate issues -> each issue becomes one entry with multiple associated code lines
+            # Done so that the Reviewer does only one RAG lookup per rule, not per occurrence
+            deduped_syntax = _deduplicate_findings(tool_input.get("syntax_findings", []))
+            deduped_security = _deduplicate_findings(tool_input.get("security_findings", []))
 
-            # Return the validated analysis with metadata
+            analysis = {**tool_input, "syntax_findings": deduped_syntax, "security_findings": deduped_security}
+
             return json.dumps({
                 "status": "success",
-                "analysis_results": tool_input,  # pass through the full structured data
+                "analysis_results": analysis,
                 "metadata": {
-                    "total_syntax_findings": total_syntax,
-                    "total_security_findings": total_security,
-                    "total_findings": total_syntax + total_security,
+                    "total_syntax_findings": len(deduped_syntax),
+                    "total_security_findings": len(deduped_security),
+                    "total_findings": len(deduped_syntax) + len(deduped_security),
                 },
             }, indent=2)
 

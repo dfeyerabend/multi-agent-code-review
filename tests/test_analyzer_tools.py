@@ -40,3 +40,24 @@ def test_submit_analysis_unknown_tool_name():
     result = json.loads(run_analyzer_tool("nonexistent_tool", {}))
 
     assert "error" in result
+
+
+def test_submit_analysis_deduplicates_findings():
+    """Multiple findings with the same rule are collapsed into one entry with occurrences and lines."""
+    input_with_duplicates = {
+        **_VALID_INPUT,
+        "syntax_findings": [
+            {"rule": "E501", "message": "Line too long", "line": 10, "severity": "LOW", "category": "Style"},
+            {"rule": "E501", "message": "Line too long", "line": 22, "severity": "LOW", "category": "Style"},
+            {"rule": "E501", "message": "Line too long", "line": 45, "severity": "LOW", "category": "Style"},
+        ],
+    }
+    result = json.loads(run_analyzer_tool("submit_analysis", input_with_duplicates))
+
+    assert result["status"] == "success"
+    findings = result["analysis_results"]["syntax_findings"]
+    assert len(findings) == 1                        # 3 occurrences collapsed into 1
+    assert findings[0]["rule"] == "E501"
+    assert findings[0]["occurrences"] == 3
+    assert set(findings[0]["lines"]) == {10, 22, 45}
+    assert result["metadata"]["total_syntax_findings"] == 1

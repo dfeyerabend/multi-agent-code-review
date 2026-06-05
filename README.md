@@ -24,9 +24,9 @@ Code Input (file path or raw string)
              │ structured JSON
              ▼
 ┌───────────────────────────┐
-│      Reviewer Agent       │  ← MCP tools: knowledge_search (RAG), classify_severity
-│  Classify findings by     │
-│  category + severity      │
+│      Reviewer Agent       │  ← MCP tools: knowledge_search (RAG)
+│  Enrich findings with     │  ← Local tool: submit_review (structured output)
+│  best-practice context    │
 └────────────┬──────────────┘
              │ structured JSON
              ▼
@@ -55,7 +55,7 @@ Code Input (file path or raw string)
 | MCP Server (`mcp_server.py`) | ✅ Done | All code analysis tools, STDIO transport |
 | Analyzer Agent | ✅ Done | Connects to MCP, runs analysis, structured output via local tool |
 | ChromaDB + `knowledge_search` | ✅ Done | RAG knowledge base populated and ready |
-| Reviewer Agent | 🔲 In Progress | Classifies findings using RAG context |
+| Reviewer Agent | ✅ Done | Classifies findings using RAG context |
 | Optimizer Agent | 🔲 In Progress | Generates fixes grounded in best practices |
 | Evaluator Agent | 🔲 In Progress | LLM-as-Judge scoring + final report |
 | Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes |
@@ -68,11 +68,12 @@ Code Input (file path or raw string)
 
 A single MCP server (`code-review-mcp`) exposes all tools. Agents discover tools dynamically at runtime via STDIO — no hardcoded tool registrations on the agent side.
 
-| Tool | Purpose | Implementation |
-|---|---|---|
-| `read_code` | Read code from file path or raw string | `os.path.isfile()` routing, JSON output |
-| `detect_syntax_errors` | Static analysis: code quality + security | ruff (E,F,W,C90,B rules) + bandit via subprocess |
-| `extract_code_structure` | Extract functions, classes, imports | `ast.parse()` + `ast.walk()` |
+| Tool                                                                                                       | Purpose | Implementation |
+|------------------------------------------------------------------------------------------------------------|---|---|
+| `read_code`                                                                                                | Read code from file path or raw string | `os.path.isfile()` routing, JSON output |
+| `detect_syntax_errors`                                                                                     | Static analysis: code quality + security | ruff (E,F,W,C90,B rules) + bandit via subprocess |
+| `extract_code_structure`                                                                                   | Extract functions, classes, imports | `ast.parse()` + `ast.walk()` |
+| `knowledge_search`                                                                                   | RAG search for best-practice context | ChromaDB cosine similarity, metadata category filter |
 
 ### Agent Design
 
@@ -87,7 +88,9 @@ Agents use two types of tools simultaneously:
 - **MCP tools** — executed remotely on the MCP server via `session.call_tool()`
 - **Local tools** — executed in-process for structured output validation
 
-The agent doesn't know which tools are remote and which are local. Routing happens transparently in the orchestrator.
+The agent doesn't know which tools are remote and which are local. Routing happens transparently in the orchestrator.   
+Tool whitelisting — each agent only sees the tools it needs. Whitelists are defined in config.py and applied at runtime after list_tools(). This prevents agents from calling tools outside their responsibility.
+
 
 ### RAG Knowledge Base
 
@@ -128,7 +131,9 @@ The Evaluator agent (LLM-as-Judge) scores the pipeline's output on five dimensio
 multi-agent-code-review/
 ├── agent/
 │   ├── __init__.py
-│   └── analyzer_agent.py           # Analyzer agent with MCP + local tool routing
+│   ├── agent_utils.py          # Shared utilities (MCP tool format conversion)
+│   ├── analyzer_agent.py       # Analyzer agent
+│   └── reviewer_agent.py       # Reviewer agent
 ├── knowledge_base/
 │   ├── create_database.py          # Run once to populate ChromaDB from documents
 │   ├── inspect_database.py         # Dev utility to inspect database contents
@@ -137,12 +142,14 @@ multi-agent-code-review/
 │       └── company_rules.md        # example_company internal coding standards
 ├── tools/
 │   ├── __init__.py
-│   └── analyzer_tools.py           # Local submit_analysis tool (schema + executor)
+│   ├── analyzer_tools.py       # Local submit_analysis tool
+│   └── reviewer_tools.py       # Local submit_review tool
 ├── tests/
-│ ├── conftest.py                   # shared pytest fixtures (ChromaDB session)
-│ ├── test_mcp_tools.py             # MCP tool + helper function tests
-│ ├── test_analyzer_tools.py        # submit_analysis local tool tests
-│ └── test_rag_retrieval.py         # targeted RAG retrieval tests
+│   ├── conftest.py
+│   ├── test_mcp_tools.py       # MCP tools + knowledge_search tests
+│   ├── test_analyzer_tools.py  # submit_analysis tests incl. deduplication
+│   ├── test_reviewer_tools.py  # submit_review schema validation tests
+│   └── test_rag_retrieval.py
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
 ├── requirements.txt
@@ -162,6 +169,7 @@ LLM agent behavior is not unit tested — it is non-deterministic and observed v
 | `tests/test_mcp_tools.py` | All MCP tool functions + severity/category helper functions |
 | `tests/test_analyzer_tools.py` | `submit_analysis` local tool — schema validation and error handling |
 | `tests/test_rag_retrieval.py` | ChromaDB retrieval — one targeted test per company rule, proving RAG context is active |
+| `tests/test_reviewer_tools.py` | submit_review local tool — schema validation, empty findings, type guards |
 
 ```bash
 pytest                   # full suite
@@ -173,13 +181,17 @@ pytest -k "read_code"    # filter by name
 ## Observability
 All agents and the MCP server use Python's `logging` module.
 Log verbosity is controlled by a single environment variable:
+
 | Level | Output |
 |---|---|
 | `INFO` (default) | Agent steps, tool calls, finding counts |
 | `DEBUG` | Full tool inputs and outputs for tracing the agent loop |
+
 ```bash
 LOG_LEVEL=DEBUG python agent/analyzer_agent.py   # full trace
 python agent/analyzer_agent.py                   # clean output
+LOG_LEVEL=DEBUG python agent/reviewer_agent.py   # full trace
+python agent/reviewer_agent.py                   # clean output
 ```
 
 ---
