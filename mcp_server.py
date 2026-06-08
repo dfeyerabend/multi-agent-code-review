@@ -448,6 +448,119 @@ def knowledge_search(query: str, category: str = "", n_results: int = 3) -> str:
             "message": str(e),
         }, indent=2)
 
+@mcp.tool()
+def generate_fix_suggestion(code: str, finding_line: int) -> str:
+    """
+        Extracts the function source that contains a given finding line.
+
+        Pipeline: called by the Optimizer Agent once per finding, before generating
+        a fix. Returns the narrowest possible context so the Optimizer works on
+        real code, not just the flagged line.
+
+        The tool never crashes the pipeline. When full context cannot be extracted
+        (syntax error, line outside any function) it falls back to surrounding lines
+        and sets status="fallback" so the Evaluator can flag limited-context fixes.
+
+        Args:
+            code:           Python source code — either a full file or a raw snippet.
+            finding_line:   1-based line number from the finding.
+
+        Returns:
+            JSON string with fields:
+            - status:           "success" | "fallback" | "error"
+            - function_name:    Name of the enclosing function, or null on fallback.
+            - function_source:  Extracted source lines as a single string.
+            - start_line:       1-based index of the first returned line.
+            - end_line:         1-based index of the last returned line.
+            - context_type:     "function" | "surrounding_lines"
+            - fallback_reason:  Present only when status="fallback".
+    """
+
+    logger.info("generate_fix_suggestion called | finding_line=%d", finding_line)
+
+    # --- Guard: empty code ---
+    if not code or not code.strip():
+        logger.warning("generate_fix_suggestion: empty code received")
+        return json.dumps({
+            "status": "error",
+            "message": "code must not be empty.",
+        }, indent=2)
+
+    lines = code.splitlines()
+    total_lines = len(lines)
+
+    # --- Guard: line out of range ---
+    if finding_line < 1 or finding_line > total_lines:
+        logger.warning(
+            "generate_fix_suggestion: finding_line=%d out of range (1–%d)",
+            finding_line, total_lines,
+        )
+        return json.dumps({
+            "status": "error",
+            "message": (
+                f"finding_line {finding_line} is out of range "
+                f"(file has {total_lines} lines)."
+            ),
+        }, indent=2)
+
+    # --- Helper: surrounding-lines fallback ---
+    # Defined here so it closes over `lines`, `total_lines`, and `finding_line`
+    def _surrounding_lines(reason: str) -> str:
+        n = 5
+        start = max(1, finding_line - n)
+        end = min(total_lines, finding_line + n)
+        snippet = "\n".join(lines[start - 1: end])
+        logger.info(
+            "generate_fix_suggestion fallback: %s | lines %d–%d", reason, start, end
+        )
+        return json.dumps({
+            "status": "fallback",
+            "fallback_reason": reason,
+            "function_name": None,
+            "function_source": snippet,
+            "start_line": start,
+            "end_line": end,
+            "context_type": "surrounding_lines",
+        }, indent=2)
+
+    # --- Happy path: AST parse ---
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        # Code has a syntax error — surrounding lines is the best we can do
+        return _surrounding_lines(f"SyntaxError at line {e.lineno}: {e.msg}")
+
+    # Walk all FunctionDef nodes and keep those whose line range spans finding_line
+    candidates = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.lineno <= finding_line <= node.end_lineno:
+                candidates.append(node)
+
+    if not candidates:
+        return _surrounding_lines("finding_line is not inside any function")
+
+    # Innermost function = smallest line range (nested functions have smaller spans)
+    innermost = min(candidates, key=lambda n: n.end_lineno - n.lineno)
+
+    start = innermost.lineno
+    end = innermost.end_lineno
+    snippet = "\n".join(lines[start - 1: end])
+
+    logger.info(
+        "generate_fix_suggestion: function '%s' lines %d–%d",
+        innermost.name, start, end,
+    )
+    return json.dumps({
+        "status": "success",
+        "function_name": innermost.name,
+        "function_source": snippet,
+        "start_line": start,
+        "end_line": end,
+        "context_type": "function",
+    }, indent=2)
+
+
 
 # --- Start the server ---
 if __name__ == "__main__":

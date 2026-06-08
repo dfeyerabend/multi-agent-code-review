@@ -92,41 +92,66 @@ ENRICHER_PROMPT = (
 
 OPTIMIZER_PROMPT = (
     "You are the Optimizer Agent in a code review pipeline. "
-    "You receive enriched findings and the full source code they refer to. "
-    "Your job is to generate a concrete, correct fix for each finding."
+    "You receive a list of code issues with context already attached, "
+    "and the original source code those issues refer to. "
+    "Your job is to generate a concrete, correct fix for each issue."
     "\n\n"
 
     "## Your Tools\n"
-    "- `knowledge_search`: Optional. Use only for complex findings where additional "
-    "context would meaningfully improve the fix.\n"
+    "- `generate_fix_suggestion`: Call this first for every finding. "
+    "Pass the full `code` and the finding's `line` number. "
+    "It returns the enclosing function source so you fix real context, "
+    "not just the flagged line.\n"
+    "- `knowledge_search`: Optional. Use only if the provided `rationale` and "
+    "`best_practice_refs` do not give you enough guidance to write a confident fix — "
+    "and only with a query specific to the fix approach, not the issue description.\n"
     "- `submit_optimization`: Local tool. Call this once as your final step.\n"
     "\n"
 
     "## Input format\n"
     "You receive a JSON object with two keys:\n"
-    "- `code`: the full source file being reviewed\n"
-    "- `findings`: a list of enriched findings, each with rule, line, severity, "
-    "category, rationale, and best_practice_refs from the Enricher\n"
+    "- `code`: the original, unmodified source code\n"
+    "- `findings`: a list of issues, each with these fields:\n"
+    "  - `rule`: the rule code that flagged this issue (e.g. 'B608', 'W291')\n"
+    "  - `line`: the line number where the issue occurs (1-based)\n"
+    "  - `severity`: how critical the issue is — LOW, MEDIUM, HIGH, or CRITICAL\n"
+    "  - `category`: the type of issue — Security, Logic, Maintainability, or Style\n"
+    "  - `rationale`: why this is a problem and which best practice applies — "
+    "use this to understand what the fix must achieve\n"
+    "  - `best_practice_refs`: excerpts from style guides or company standards — "
+    "use these to ground your fix and populate `grounded_in`\n"
+    "  - `doc_url`: fallback reference if `best_practice_refs` is empty\n"
     "\n"
 
     "## Workflow\n"
     "For each finding in `findings`:\n"
-    "1. Locate the relevant code using the `line` field.\n"
-    "2. Use the `rationale` and `best_practice_refs` already provided — "
-    "these are grounded in best practices and should guide your fix.\n"
-    "3. Generate a `suggested_code` snippet that concretely fixes the issue.\n"
-    "4. Write an `explanation` of what was changed and why.\n"
-    "5. List the sources you relied on in `grounded_in` "
-    "(from best_practice_refs or any knowledge_search you called).\n"
+    "1. Call `generate_fix_suggestion` with the full `code` and the finding's `line`.\n"
+    "   - If it returns `status: 'error'`: skip this finding, set `suggested_code` to null, "
+    "and record the error message in `explanation`.\n"
+    "2. Use the returned `function_source` as your code context.\n"
+    "   - If `context_type` is `surrounding_lines`: generate the best fix you can "
+    "from the visible lines and state in `explanation` that full function context "
+    "was unavailable.\n"
+    "3. Determine what the fix must achieve:\n"
+    "   - If `best_practice_refs` is non-empty: use those excerpts to guide the fix.\n"
+    "   - If `best_practice_refs` is empty: use `doc_url` as your reference instead.\n"
+    "   - Use `rationale` to understand the problem — do not copy it into `explanation`.\n"
+    "4. Generate a `suggested_code` snippet. Return only the fixed lines or the modified "
+    "function — not the full file.\n"
+    "5. Write an `explanation` of what was changed and why the change resolves the issue.\n"
+    "6. Populate `grounded_in` with the sources you relied on, "
+    "using the format: 'pyguide §3.10' or 'company_rules §1.3' or the `doc_url` value. "
+    "Example: [\"pyguide §2.1\", \"company_rules §1.4\"]\n"
     "After processing all findings, call `submit_optimization`.\n"
     "\n"
 
     "## Rules\n"
-    "- Generate a fix for every finding in the list — do not skip any.\n"
+    "- Generate a fix for every finding in the list — do not skip any unless "
+    "`generate_fix_suggestion` returned an error for that finding.\n"
     "- `suggested_code` must be valid Python. Never produce broken code.\n"
     "- Fixes must be minimal — change only what is needed to resolve the finding.\n"
-    "- If a finding is informational with no code change needed, set `suggested_code` "
-    "to the original code and explain why in `explanation`.\n"
+    "- If a finding is informational with no code change needed, return the original "
+    "lines unchanged and explain why in `explanation`.\n"
     "- Do not invent findings that are not in the input list.\n"
 )
 
@@ -136,8 +161,13 @@ ANALYZER_TOOLS = {"read_code", "detect_syntax_errors", "extract_code_structure"}
 ENRICHER_TOOLS = {"knowledge_search"}
 OPTIMIZER_TOOLS = {"knowledge_search", "generate_fix_suggestion"}
 
-ENRICHER_BATCH_SIZE = 5     # findings per Enricher batch
-OPTIMIZER_BATCH_SIZE = 3    # work items per Optimizer batch (smaller — carries function source)
+ENRICHER_BATCH_SIZE = 5         # findings per Enricher batch
+
+OPTIMIZER_STYLE_BATCH_SIZE = 25 # max findings per rule-code group for Style issues
+
+# Override sets — populated during testing when specific edge cases are identified.
+OPTIMIZER_FORCE_GROUPED    = set()  # Security/Logic/Maintainability rule IDs → grouped
+OPTIMIZER_FORCE_INDIVIDUAL = set()  # Style rule IDs → individual
 
 # === LOGGING SETUP ===
 import logging

@@ -21,7 +21,9 @@ from config import (
     MCP_SERVER_PATH,
     OPTIMIZER_PROMPT,
     OPTIMIZER_TOOLS,
-    OPTIMIZER_BATCH_SIZE,
+    OPTIMIZER_STYLE_BATCH_SIZE,
+    OPTIMIZER_FORCE_GROUPED,
+    OPTIMIZER_FORCE_INDIVIDUAL,
 )
 
 from tools.optimizer_tools import (
@@ -32,16 +34,74 @@ from tools.optimizer_tools import (
 LOCAL_TOOL_NAMES = {t["name"] for t in optimizer_local_tools}
 
 
+async def run_optimizer_single(
+    finding: dict,
+    code: str,
+    session: ClientSession,
+    all_tools: list,
+) -> dict:
+    """
+    Runs one Optimizer LLM call for a single finding.
+
+    Pipeline: called by run_optimizer for every Security, Logic, and
+    Maintainability finding, and for any Style rule overridden via
+    OPTIMIZER_FORCE_INDIVIDUAL.
+
+    Args:
+        finding:    Single enriched finding dict from the Enricher.
+        code:       Full source code string from the Analyzer.
+        session:    Active MCP client session, shared across all calls.
+        all_tools:  Combined MCP + local tool list.
+
+    Returns:
+        dict with fix output for this finding, or error info.
+    """
+    return await _run_optimizer_batch(code, [finding], session, all_tools)
+
+
+async def run_optimizer_group(
+    findings: list,
+    code: str,
+    session: ClientSession,
+    all_tools: list,
+) -> dict:
+    """
+    Runs one Optimizer LLM call for a group of same-rule findings.
+
+    Pipeline: called by run_optimizer for each Style rule-code group
+    (chunked at OPTIMIZER_STYLE_BATCH_SIZE before this is called).
+
+    Args:
+        findings:   List of findings sharing the same rule code.
+        code:       Full source code string from the Analyzer.
+        session:    Active MCP client session, shared across all calls.
+        all_tools:  Combined MCP + local tool list.
+
+    Returns:
+        dict with fix output for this group, or error info.
+    """
+    return await _run_optimizer_batch(code, findings, session, all_tools)
+
+
 async def run_optimizer(code: str, enriched_findings: list) -> dict:
     """
-    Connects to MCP, generates fixes for enriched findings in batches, returns merged output.
+    Connects to MCP, routes findings, generates fixes, returns merged output.
+
+    Pipeline: Step 3 in the pipeline. Called by the orchestrator with the
+    full source code and all enriched findings from the Enricher.
+
+    Security, Logic, and Maintainability findings are processed individually
+    — one LLM call each — to keep fix reasoning focused. Style findings are
+    grouped by rule code and processed in batches of OPTIMIZER_STYLE_BATCH_SIZE
+    so repeated instances of the same rule (e.g. trailing whitespace) are
+    resolved in a single call.
 
     Args:
         code:              Full source code string from the Analyzer.
         enriched_findings: List of enriched finding dicts from the Enricher.
 
     Returns:
-        dict with merged fix suggestions or error info.
+        dict with merged fix suggestions across all findings, or error info.
     """
     if not enriched_findings:
         return {
@@ -55,47 +115,119 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
         args=[MCP_SERVER_PATH],
     )
 
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+    try:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
 
-            tools_result = await session.list_tools()
-            mcp_tools = convert_mcp_tools_to_anthropic(tools_result.tools)
-            mcp_tools = [t for t in mcp_tools if t["name"] in OPTIMIZER_TOOLS]
-            all_tools = mcp_tools + optimizer_local_tools
+                tool_list = await session.list_tools()
+                mcp_tools = convert_mcp_tools_to_anthropic(tool_list.tools)
+                mcp_tools = [t for t in mcp_tools if t["name"] in OPTIMIZER_TOOLS]
+                all_tools = mcp_tools + optimizer_local_tools
 
-            tool_summary = [
-                f"{t['name']} ({'local' if t['name'] in LOCAL_TOOL_NAMES else 'MCP'})"
-                for t in all_tools
-            ]
-            logger.info("Connected to MCP. Tools: %s", ", ".join(tool_summary))
+                tool_summary = [
+                    f"{t['name']} ({'local' if t['name'] in LOCAL_TOOL_NAMES else 'MCP'})"
+                    for t in all_tools
+                ]
+                logger.info("Connected to MCP. Tools: %s", ", ".join(tool_summary))
 
-            batches = chunk_list(enriched_findings, OPTIMIZER_BATCH_SIZE)
-            logger.info("Processing %d finding(s) in %d batch(es)", len(enriched_findings), len(batches))
+                individual_findings, style_groups = _route_findings(enriched_findings)
 
-            all_fixes = []
+                total_calls = len(individual_findings) + sum(
+                    -(-len(v) // OPTIMIZER_STYLE_BATCH_SIZE)
+                    for v in style_groups.values()
+                )
+                logger.info(
+                    "Routing: %d individual call(s) + %d style group(s) → %d total call(s)",
+                    len(individual_findings), len(style_groups), total_calls,
+                )
 
-            for i, batch in enumerate(batches):
-                logger.info("Batch %d/%d — %d finding(s)", i + 1, len(batches), len(batch))
-                batch_result = await _run_optimizer_batch(code, batch, session, all_tools)
+                all_fixes = []
+                failed_count = 0
 
-                if batch_result.get("status") != "success":
-                    logger.error("Batch %d failed: %s", i + 1, batch_result.get("message"))
-                    return batch_result
+                # --- Individual findings ---
+                for i, finding in enumerate(individual_findings):
+                    logger.info(
+                        "Individual call %d/%d — rule %s line %d",
+                        i + 1, len(individual_findings),
+                        finding.get("rule"), finding.get("line"),
+                    )
+                    result = await run_optimizer_single(finding, code, session, all_tools)
 
-                all_fixes.extend(batch_result["optimization_results"]["fixes"])
+                    if result.get("status") != "success":
+                        logger.error(
+                            "Individual call failed for rule %s line %s after max iterations — skipping. Reason: %s",
+                            finding.get("rule"), finding.get("line"), result.get("message"),
+                        )
+                        all_fixes.append({
+                            "finding_rule": finding.get("rule"),
+                            "finding_line": finding.get("line"),
+                            "suggested_code": None,
+                            "explanation": f"Optimizer failed after max iterations: {result.get('message', 'unknown error')}",
+                            "grounded_in": [],
+                        })
+                        failed_count += 1
+                        continue
 
-            total = len(all_fixes)
-            summary = f"{total} fix(es) generated for {len(enriched_findings)} finding(s)."
+                    all_fixes.extend(result["optimization_results"]["fixes"])
 
-            return {
-                "status": "success",
-                "optimization_results": {
-                    "fixes": all_fixes,
-                    "summary": summary,
-                },
-                "metadata": {"total_fixes": total},
-            }
+                # --- Style groups ---
+                for rule_code, group_findings in style_groups.items():
+                    chunks = chunk_list(group_findings, OPTIMIZER_STYLE_BATCH_SIZE)
+                    logger.info(
+                        "Style group '%s': %d finding(s) → %d chunk(s)",
+                        rule_code, len(group_findings), len(chunks),
+                    )
+                    for j, chunk in enumerate(chunks):
+                        logger.info(
+                            "Style group '%s' chunk %d/%d — %d finding(s)",
+                            rule_code, j + 1, len(chunks), len(chunk),
+                        )
+                        result = await run_optimizer_group(chunk, code, session, all_tools)
+
+                        if result.get("status") != "success":
+                            logger.error(
+                                "Style group '%s' chunk %d failed after max iterations — skipping. Reason: %s",
+                                rule_code, j + 1, result.get("message"),
+                            )
+                            for finding in chunk:
+                                all_fixes.append({
+                                    "finding_rule": finding.get("rule"),
+                                    "finding_line": finding.get("line"),
+                                    "suggested_code": None,
+                                    "explanation": f"Optimizer failed after max iterations: {result.get('message', 'unknown error')}",
+                                    "grounded_in": [],
+                                })
+                            failed_count += len(chunk)
+                            continue
+
+                        all_fixes.extend(result["optimization_results"]["fixes"])
+
+                total = len(all_fixes)
+                summary = (
+                    f"{total - failed_count} fix(es) generated, "
+                    f"{failed_count} finding(s) unresolved."
+                    if failed_count
+                    else f"{total} fix(es) generated for {len(enriched_findings)} finding(s)."
+                )
+
+                return {
+                    "status": "success",
+                    "optimization_results": {
+                        "fixes": all_fixes,
+                        "summary": summary,
+                    },
+                    "metadata": {
+                        "total_fixes": total,
+                        "failed_count": failed_count,
+                    },
+                }
+    except Exception as e:
+        logger.error("Optimizer failed to connect to MCP server: %s", str(e))
+        return {
+            "status": "error",
+            "message": f"MCP connection failed — likely mcp_server.py is missing or has a syntax error: {str(e)}",
+        }
 
 
 async def _run_optimizer_batch(code: str, findings_batch: list, session: ClientSession, all_tools: list) -> dict:
@@ -169,8 +301,8 @@ async def _run_optimizer_batch(code: str, findings_batch: list, session: ClientS
 
             messages.append({"role": "user", "content": tool_results})
 
-    logger.warning("Reached max iterations (%d)", MAX_ITERATIONS)
-    return {"status": "error", "message": "Max iterations reached"}
+    logger.warning("Reached max iterations (%d) without valid output", MAX_ITERATIONS)
+    return {"status": "error", "message": "Max iterations reached without valid output"}
 
 
 def _extract_final_output(messages: list, final_response) -> dict:
@@ -242,3 +374,56 @@ if __name__ == "__main__":
     print("FINAL OUTPUT:")
     print("=" * 60)
     print(json.dumps(result, indent=2))
+
+def _route_findings(
+    findings: list,
+) -> tuple[list, dict[str, list]]:
+    """
+    Splits findings into individual and grouped buckets for routing.
+
+    Pipeline: called once by run_optimizer after MCP session opens, before
+    any LLM calls. Determines which findings get their own call and which
+    are batched together by rule code.
+
+    Style findings are grouped by rule code so all instances of the same
+    rule (e.g. 20 × W291) are resolved in one LLM call. Security, Logic,
+    and Maintainability findings get individual calls by default — mixed
+    context degrades fix quality for complex issues.
+
+    Config overrides (OPTIMIZER_FORCE_GROUPED / OPTIMIZER_FORCE_INDIVIDUAL)
+    let specific rule IDs opt out of the default without changing this logic.
+
+    Args:
+        findings: List of enriched finding dicts from the Enricher.
+
+    Returns:
+        Tuple of:
+        - individual_findings: flat list, one LLM call each.
+        - style_groups: dict mapping rule_code → list of findings,
+          one LLM call per group (chunked later at OPTIMIZER_STYLE_BATCH_SIZE).
+    """
+    individual_findings = []
+    style_groups: dict[str, list] = {}
+
+    for finding in findings:
+        category  = finding.get("category", "")
+        rule_code = finding.get("rule", "unknown")
+
+        if category == "Style" and rule_code not in OPTIMIZER_FORCE_INDIVIDUAL:
+            # Group by rule code — all instances of the same Style rule in one call
+            style_groups.setdefault(rule_code, []).append(finding)
+
+        elif category != "Style" and rule_code in OPTIMIZER_FORCE_GROUPED:
+            # Config override: treat this Security/Logic/Maintainability rule as grouped
+            style_groups.setdefault(rule_code, []).append(finding)
+
+        else:
+            individual_findings.append(finding)
+
+    logger.info(
+        "_route_findings: %d individual | %d style group(s) covering %d finding(s)",
+        len(individual_findings),
+        len(style_groups),
+        sum(len(v) for v in style_groups.values()),
+    )
+    return individual_findings, style_groups

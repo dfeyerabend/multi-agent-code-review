@@ -57,7 +57,7 @@ Code Input (file path or raw string)
 | ChromaDB + `knowledge_search` | ✅ Done | RAG knowledge base populated and ready |
 | Enricher Agent | ✅ Done | Enriches findings with RAG context; batched to prevent context overflow |
 | Orchestrator | ✅ Done | Linear pipeline driver; owns pipeline state; builds per-agent input contracts |
-| Optimizer Agent | 🔲 Pending | Generates fixes grounded in best practices |
+| Optimizer Agent | ✅ Done | Category-aware fix routing; Security/Logic/Maintainability processed individually, Style grouped by rule code |
 | Evaluator Agent | 🔲 Pending | LLM-as-Judge scoring + final report |
 | Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes |
 
@@ -69,12 +69,13 @@ Code Input (file path or raw string)
 
 A single MCP server (`code-review-mcp`) exposes all tools. Agents discover tools dynamically at runtime via STDIO — no hardcoded tool registrations on the agent side.
 
-| Tool                                                                                                       | Purpose | Implementation |
-|------------------------------------------------------------------------------------------------------------|---|---|
-| `read_code`                                                                                                | Read code from file path or raw string | `os.path.isfile()` routing, JSON output |
-| `detect_syntax_errors`                                                                                     | Static analysis: code quality + security | ruff (E,F,W,C90,B rules) + bandit via subprocess |
-| `extract_code_structure`                                                                                   | Extract functions, classes, imports | `ast.parse()` + `ast.walk()` |
-| `knowledge_search`                                                                                   | RAG search for best-practice context | ChromaDB cosine similarity, metadata category filter |
+| Tool                        | Purpose | Implementation |
+|-----------------------------|---|---|
+| `read_code`                 | Read code from file path or raw string | `os.path.isfile()` routing, JSON output |
+| `detect_syntax_errors`      | Static analysis: code quality + security | ruff (E,F,W,C90,B rules) + bandit via subprocess |
+| `extract_code_structure`    | Extract functions, classes, imports | `ast.parse()` + `ast.walk()` |
+| `knowledge_search`          | RAG search for best-practice context | ChromaDB cosine similarity, metadata category filter |
+| `generate_fix_suggestion`   | Extract enclosing function source for a finding line | AST walk, falls back to surrounding lines on syntax error or module-level code |
 
 ### Agent Design
 
@@ -135,6 +136,7 @@ multi-agent-code-review/
 │ ├── agent_utils.py                # Shared utilities (MCP tool format conversion, chunking)
 │ ├── analyzer_agent.py             # Analyzer agent
 │ └── enricher_agent.py             # Enricher agent (batched)
+│ └── optimizer_agent.py            # Optimizer agent (category-aware routing)
 ├── knowledge_base/
 │ ├── create_database.py            # Run once to populate ChromaDB from documents
 │ ├── inspect_database.py           # Dev utility to inspect database contents
@@ -145,6 +147,7 @@ multi-agent-code-review/
 │ ├── init.py
 │ ├── analyzer_tools.py             # Local submit_analysis tool
 │ └── enricher_tools.py             # Local submit_enrichment tool
+│ └── optimizer_tools.py            # Local submit_optimization tool
 ├── tests/
 │ ├── conftest.py
 │ ├── test_mcp_tools.py             # MCP tools + knowledge_search tests
@@ -152,6 +155,7 @@ multi-agent-code-review/
 │ ├── test_enricher_tools.py        # submit_enrichment schema validation tests
 │ ├── test_agent_utils.py           # chunk_list utility tests
 │ └── test_rag_retrieval.py
+│ └── test_optimizer_tools.py       # submit_optimization schema validation tests
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
 ├── orchestrator.py                 # Pipeline driver — Analyzer → Enricher → (Optimizer stub)
@@ -173,6 +177,7 @@ LLM agent behavior is not unit tested — it is non-deterministic and observed v
 | `tests/test_analyzer_tools.py` | `submit_analysis` local tool — schema validation and error handling |
 | `tests/test_rag_retrieval.py` | ChromaDB retrieval — one targeted test per company rule, proving RAG context is active |
 | `tests/test_enricher_tools.py` | submit_enrichment local tool — schema validation, empty findings, type guards |
+| `tests/test_optimizer_tools.py` | `submit_optimization` local tool — schema validation, empty fixes, type guards |
 
 ```bash
 pytest                   # full suite

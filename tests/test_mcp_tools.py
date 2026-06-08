@@ -7,7 +7,11 @@ import json
 import os
 import pytest
 
-from mcp_server import read_code, detect_syntax_errors, extract_code_structure, _ruff_severity, _ruff_category, knowledge_search
+from mcp_server import (
+    read_code, detect_syntax_errors, extract_code_structure,
+    _ruff_severity, _ruff_category, knowledge_search,
+    generate_fix_suggestion,
+)
 
 # Absolute path to mcp_server.py — used as a real file input in read_code tests.
 # os.path.dirname(__file__) is the tests/ folder, so we go one level up.
@@ -176,4 +180,114 @@ def test_knowledge_search_nonsense_query_does_not_crash(chroma_collection):
     assert result["status"] == "success"                            # closest match returned, not an error
     for chunk in result["results"]:
         assert chunk["distance"] > 1.0                              # no real match — all results are semantically distant
+
+
+# ── generate_fix_suggestion ───────────────────────────────────────────────────
+
+# Two-function module used across multiple tests.
+_TWO_FUNC_CODE = (
+    "def outer(x):\n"           # line 1
+    "    y = x + 1\n"           # line 2
+    "    def inner(z):\n"       # line 3
+    "        return z * 2\n"    # line 4
+    "    return inner(y)\n"     # line 5
+    "\n"                        # line 6
+    "def standalone(a, b):\n"   # line 7
+    "    return a - b\n"        # line 8
+)
+
+
+def test_generate_fix_suggestion_happy_path_innermost():
+    """Returns the innermost function when finding_line sits inside a nested function."""
+    result = json.loads(generate_fix_suggestion(_TWO_FUNC_CODE, finding_line=4))
+
+    assert result["status"] == "success"
+    assert result["function_name"] == "inner"
+    assert result["context_type"] == "function"
+    assert result["start_line"] == 3
+    assert result["end_line"] == 4
+
+
+def test_generate_fix_suggestion_happy_path_outer():
+    """Returns the outer function when finding_line is in outer but not inner."""
+    result = json.loads(generate_fix_suggestion(_TWO_FUNC_CODE, finding_line=2))
+
+    assert result["status"] == "success"
+    assert result["function_name"] == "outer"
+    assert result["context_type"] == "function"
+
+
+def test_generate_fix_suggestion_happy_path_standalone():
+    """Returns the correct function when finding_line is in a top-level function."""
+    result = json.loads(generate_fix_suggestion(_TWO_FUNC_CODE, finding_line=8))
+
+    assert result["status"] == "success"
+    assert result["function_name"] == "standalone"
+    assert result["start_line"] == 7
+    assert result["end_line"] == 8
+
+
+def test_generate_fix_suggestion_function_source_content():
+    """function_source contains the actual lines of the matched function."""
+    result = json.loads(generate_fix_suggestion(_TWO_FUNC_CODE, finding_line=8))
+
+    assert "def standalone" in result["function_source"]
+    assert "return a - b" in result["function_source"]
+
+
+def test_generate_fix_suggestion_module_level_fallback():
+    """Falls back to surrounding lines when finding_line is outside any function."""
+    code = (
+        "import os\n"
+        "X = os.environ['KEY']\n"   # line 2 — module-level, no enclosing function
+    )
+    result = json.loads(generate_fix_suggestion(code, finding_line=2))
+
+    assert result["status"] == "fallback"
+    assert result["context_type"] == "surrounding_lines"
+    assert result["function_name"] is None
+    assert "fallback_reason" in result
+
+
+def test_generate_fix_suggestion_syntax_error_fallback():
+    """Falls back to surrounding lines when the code cannot be parsed."""
+    bad_code = "def broken(:\n    pass\nmore_code = 1\n"
+    result = json.loads(generate_fix_suggestion(bad_code, finding_line=3))
+
+    assert result["status"] == "fallback"
+    assert result["context_type"] == "surrounding_lines"
+    assert result["function_name"] is None
+    assert "SyntaxError" in result["fallback_reason"]
+
+
+def test_generate_fix_suggestion_fallback_source_is_nonempty():
+    """Fallback always returns a non-empty function_source so the Optimizer has something to work with."""
+    code = "X = 1\nY = 2\nZ = 3\n"
+    result = json.loads(generate_fix_suggestion(code, finding_line=2))
+
+    assert result["status"] == "fallback"
+    assert len(result["function_source"]) > 0
+
+
+def test_generate_fix_suggestion_line_out_of_range():
+    """Returns error when finding_line exceeds the total line count."""
+    result = json.loads(generate_fix_suggestion("x = 1\n", finding_line=99))
+
+    assert result["status"] == "error"
+    assert "out of range" in result["message"]
+
+
+def test_generate_fix_suggestion_line_zero():
+    """Returns error for finding_line=0 — lines are 1-based."""
+    result = json.loads(generate_fix_suggestion("x = 1\n", finding_line=0))
+
+    assert result["status"] == "error"
+
+
+def test_generate_fix_suggestion_empty_code():
+    """Returns error when code is an empty string."""
+    result = json.loads(generate_fix_suggestion("", finding_line=1))
+
+    assert result["status"] == "error"
+    assert "empty" in result["message"]
 
