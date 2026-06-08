@@ -10,6 +10,8 @@ import sys
 import json
 import subprocess
 import tempfile
+import chromadb
+from config import CHROMA_DB_PATH
 from mcp.server.fastmcp import FastMCP
 
 # Setup Logging
@@ -383,49 +385,50 @@ def extract_code_structure(code: str) -> str:
 @mcp.tool()
 def knowledge_search(query: str, category: str = "", n_results: int = 3) -> str:
     """
-   Searches the ChromaDB knowledge base for best-practice context.
+    Searches the ChromaDB knowledge base for best-practice context.
 
-   Args:
-       query:     Natural language search string, typically rule code + message.
-       category:  Optional metadata filter — "Style", "Logic", "Maintainability", or "Security".
-       n_results: Number of chunks to return (default 3).
+    Pipeline: called by the Enricher Agent once per finding via MCP STDIO.
+    chromadb is imported at module level so the server loads it on startup,
+    not on the first tool call (lazy import causes an 8-minute stall under
+    FastMCP's worker thread).
 
-   Returns:
-       JSON string with a list of matching chunks, each containing text,
-       source, section, category, and relevance distance.
-   """
-    import chromadb
-    from config import CHROMA_DB_PATH
+    Args:
+        query:     Natural language search string, typically rule code + message.
+        category:  Optional metadata filter — "Style", "Logic", "Maintainability", or "Security".
+        n_results: Number of chunks to return (default 3).
 
+    Returns:
+        JSON string with a list of matching chunks, each containing text,
+        source, section, category, and relevance distance.
+    """
     logger.info("knowledge_search called | query: %s | category: %s", query, category)
 
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)         # connect to the on-disk ChromaDB store
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         collection = client.get_collection("code_best_practices")
 
         query_kwargs = {
             "query_texts": [query],
-            "n_results": n_results,                                     # N of chunks returned
-            "include": ["documents", "metadatas", "distances"],         # include in addition to ID
+            "n_results": n_results,
+            "include": ["documents", "metadatas", "distances"],
         }
-
-        if category:                                                    # only filter when caller provides a value — empty where={} crashes ChromaDB
+        if category:
             query_kwargs["where"] = {"category": category}
 
         results = collection.query(**query_kwargs)
 
         chunks = []
-        documents = results.get("documents", [[]])[0]                   # ChromaDB returns nested lists — [0] unwraps the single-query layer
+        documents = results.get("documents", [[]])[0]   # ChromaDB nests one layer per query — [0] unwraps it
         metadatas = results.get("metadatas", [[]])[0]
         distances = results.get("distances", [[]])[0]
 
-        for doc, meta, dist in zip(documents, metadatas, distances):    # zip pairs each document with its matching metadata and distance by position
+        for doc, meta, dist in zip(documents, metadatas, distances):
             chunks.append({
                 "text": doc,
                 "source": meta.get("source"),
                 "section": meta.get("section"),
                 "category": meta.get("category"),
-                "distance": round(dist, 4),                             # rounded for readability in logs and agent context
+                "distance": round(dist, 4),
             })
 
         logger.info("knowledge_search: %d chunks returned", len(chunks))

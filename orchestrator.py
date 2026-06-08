@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 from agent.analyzer_agent import run_analyzer
 from agent.enricher_agent import run_enricher
+from agent.optimizer_agent import run_optimizer
 
 # Fields the Enricher needs from each finding — everything else stays in the orchestrator.
 _ENRICHER_FIELDS = {"rule", "line", "category", "severity", "message", "doc_url", "cwe_id"}
@@ -50,13 +51,21 @@ async def run_pipeline(code_input: str) -> dict:
         logger.error("Enricher failed: %s", enricher_result.get("message"))
         return enricher_result
 
-    # --- Step 3: Optimizer (stub) ---
-    # TODO: build work_items and wire run_optimizer — Phase 3
+    # --- Step 3: Optimizer ---
+    enriched_findings = enricher_result["enrichment_results"]["findings"]
+    code = analysis["code"]
+
+    logger.info("Pipeline — step 3: Optimizer — %d finding(s)", len(enriched_findings))
+    optimizer_result = await run_optimizer(code, enriched_findings)
+
+    if optimizer_result.get("status") != "success":
+        logger.error("Optimizer failed: %s", optimizer_result.get("message"))
+        return optimizer_result
 
     # --- Step 4: Evaluator (stub) ---
-    # TODO: wire run_evaluator — Phase 3
+    # TODO: wire run_evaluator
 
-    return enricher_result
+    return optimizer_result
 
 
 if __name__ == "__main__":
