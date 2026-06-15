@@ -1,8 +1,8 @@
 """
 Local tools for the Analyzer Agent.
-These are NOT on the MCP server — they run locally in the agent process.
+These are NOT on the MCP server — they run locally in the agents process.
 The submit_analysis tool enforces a strict output schema so the
-Enricher agent always gets consistent, structured input.
+Enricher agents always gets consistent, structured input.
 """
 
 import json

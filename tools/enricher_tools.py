@@ -77,7 +77,7 @@ def run_enricher_tool(name: str, tool_input: dict) -> str:
 
     Args:
         name:       Name of the tool to execute.
-        tool_input: Dict of arguments passed by the agent.
+        tool_input: Dict of arguments passed by the agents.
 
     Returns:
         JSON string with status and validated review data, or an error message.
@@ -92,7 +92,7 @@ def run_enricher_tool(name: str, tool_input: dict) -> str:
                     "message": f"Missing required fields: {missing}",
                 })
 
-            if not isinstance(tool_input["findings"], list):                # guard against the agent passing a dict instead of a list
+            if not isinstance(tool_input["findings"], list):                # guard against the agents passing a dict instead of a list
                 return json.dumps({
                     "status": "error",
                     "message": "'findings' must be a list.",

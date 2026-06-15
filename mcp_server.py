@@ -560,6 +560,122 @@ def generate_fix_suggestion(code: str, finding_line: int) -> str:
         "context_type": "function",
     }, indent=2)
 
+# --- TOOL 5: Create Review Report ---
+@mcp.tool()
+def create_review_report(fixes_evaluated: list, summary: str) -> str:
+    """
+    Generates a human-readable markdown review report from evaluated fixes.
+
+    Pipeline: called once by the Evaluator Agent after scoring all fixes,
+    before submit_evaluation.
+
+    Args:
+        fixes_evaluated: List of evaluated fix dicts, each with finding_rule,
+                         finding_line, status, score, reasoning, suggested_code,
+                         and grounded_in.
+        summary:         Overall summary string produced by the Evaluator.
+
+    Returns:
+        JSON string with status and a markdown-formatted report string.
+    """
+    logger.info("create_review_report called | %d fix(es)", len(fixes_evaluated))
+
+    if not isinstance(fixes_evaluated, list):
+        return json.dumps({
+            "status": "error",
+            "message": f"create_review_report failed — fixes_evaluated must be a list, got {type(fixes_evaluated).__name__}",
+        }, indent=2)
+
+    if not isinstance(summary, str):
+        return json.dumps({
+            "status": "error",
+            "message": f"create_review_report failed — summary must be a string, got {type(summary).__name__}",
+        }, indent=2)
+
+    try:
+        status_emoji = {"APPROVED": "✅", "NEEDS_REVISION": "⚠️", "UNRESOLVABLE": "❌"}
+
+        approved       = [f for f in fixes_evaluated if f.get("status") == "APPROVED"]
+        needs_revision = [f for f in fixes_evaluated if f.get("status") == "NEEDS_REVISION"]
+        unresolvable   = [f for f in fixes_evaluated if f.get("status") == "UNRESOLVABLE"]
+
+        lines = [
+            "# Code Review Report",
+            "",
+            f"**{summary}**",
+            "",
+            "| Status | Count |",
+            "|--------|-------|",
+            f"| ✅ Approved       | {len(approved)} |",
+            f"| ⚠️ Needs Revision | {len(needs_revision)} |",
+            f"| ❌ Unresolvable   | {len(unresolvable)} |",
+            "",
+            "---",
+            "",
+        ]
+
+        for i, fix in enumerate(fixes_evaluated):
+            if not isinstance(fix, dict):
+                return json.dumps({
+                    "status": "error",
+                    "message": f"create_review_report failed — fixes_evaluated[{i}] must be a dict, got {type(fix).__name__}",
+                }, indent=2)
+
+            rule           = fix.get("finding_rule", "?")
+            line           = fix.get("finding_line", "?")
+            status         = fix.get("status", "?")
+            score          = fix.get("score", "?")
+            reasoning      = fix.get("reasoning", "")
+            suggested_code = fix.get("suggested_code", "")
+            grounded_in    = fix.get("grounded_in", [])
+            emoji          = status_emoji.get(status, "•")
+
+            if grounded_in and not isinstance(grounded_in, list):
+                return json.dumps({
+                    "status": "error",
+                    "message": f"create_review_report failed — grounded_in for rule {rule!r} line {line} must be a list, got {type(grounded_in).__name__}",
+                }, indent=2)
+
+            lines += [
+                f"## {emoji} Rule `{rule}` — Line {line}",
+                f"**Status:** {status} | **Score:** {score}/5",
+                "",
+                f"**Reasoning:** {reasoning}",
+                "",
+            ]
+
+            if grounded_in:
+                lines += [
+                    f"**Grounded in:** {', '.join(grounded_in)}",
+                    "",
+                ]
+
+            if suggested_code:
+                lines += [
+                    "**Suggested fix:**",
+                    "```python",
+                    suggested_code,
+                    "```",
+                    "",
+                ]
+
+            lines.append("---")
+            lines.append("")
+
+        report = "\n".join(lines)
+        logger.info("create_review_report: report generated (%d chars)", len(report))
+
+        return json.dumps({"status": "success", "report": report}, indent=2)
+
+    except Exception as e:
+        logger.error("create_review_report failed unexpectedly: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": f"create_review_report failed unexpectedly: {str(e)}",
+        }, indent=2)
+
+
+
 
 
 # --- Start the server ---

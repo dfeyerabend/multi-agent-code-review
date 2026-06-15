@@ -1,9 +1,9 @@
 """
-Tests for shared agent utilities: chunk_list.
+Tests for shared agents utilities: chunk_list.
 """
 
 import pytest
-from agent.agent_utils import chunk_list
+from agents.agent_utils import chunk_list
 
 
 def test_chunk_list_even_split():

@@ -8,7 +8,7 @@ import asyncio
 import json
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from agent.agent_utils import convert_mcp_tools_to_anthropic, chunk_list
+from agents.agent_utils import convert_mcp_tools_to_anthropic, chunk_list
 
 import logging
 logger = logging.getLogger(__name__)
@@ -232,7 +232,7 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
 
 async def _run_optimizer_batch(code: str, findings_batch: list, session: ClientSession, all_tools: list) -> dict:
     """
-    Runs the Optimizer agent loop on a single batch of findings.
+    Runs the Optimizer agents loop on a single batch of findings.
 
     Args:
         code:           Full source code string, passed once per batch.

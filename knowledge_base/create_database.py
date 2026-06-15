@@ -1,7 +1,7 @@
 """
 create_database.py
 Reads knowledge documents and loads them into ChromaDB as vector embeddings.
-Run once before starting the agent pipeline: python create_database.py
+Run once before starting the agents pipeline: python create_database.py
 """
 
 import re

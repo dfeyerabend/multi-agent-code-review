@@ -12,7 +12,7 @@ from mcp.client.stdio import stdio_client
 import logging
 logger = logging.getLogger(__name__)
 
-from agent.agent_utils import convert_mcp_tools_to_anthropic
+from agents.agent_utils import convert_mcp_tools_to_anthropic
 from config import (
     client,             # shared Anthropic client instance
     MODEL,
@@ -35,7 +35,7 @@ LOCAL_TOOL_NAMES = {t["name"] for t in analyzer_local_tools}
 
 async def run_analyzer(code_input: str) -> dict:
     """
-        Main function: connects to MCP, runs the Analyzer agent loop,
+        Main function: connects to MCP, runs the Analyzer agents loop,
         returns the structured analysis result.
 
         Args:

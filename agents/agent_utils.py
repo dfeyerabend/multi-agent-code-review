@@ -1,6 +1,6 @@
 """
 Shared utilities for all agents in the Code Review pipeline.
-Includes MCP tool format conversion and list chunking for batched agent runs.
+Includes MCP tool format conversion and list chunking for batched agents runs.
 """
 
 

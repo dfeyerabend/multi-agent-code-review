@@ -1,7 +1,7 @@
 """
 Shared configuration for the Code Review Agent pipeline.
 All agents use these settings. System prompts are defined here
-so the agent files stay focused on logic.
+so the agents files stay focused on logic.
 """
 
 import anthropic
@@ -15,7 +15,7 @@ client = anthropic.Anthropic()
 # === CLAUDE SETTINGS ===
 MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 4096       # For structured tool output
-MAX_ITERATIONS = 10      # Max iterations for every agent
+MAX_ITERATIONS = 10      # Max iterations for every agents
 
 # === PATHS ===
 import os
@@ -31,7 +31,7 @@ CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "knowledge_base", "chroma_db") # pat
 ANALYZER_PROMPT = (
     "You are the Analyzer Agent in a code review pipeline. "
     "Your job is to examine Python code using your tools and produce "
-    "a structured analysis for the next agent in the chain (the Enricher)."
+    "a structured analysis for the next agents in the chain (the Enricher)."
     "\n\n"
 
     "## Your Tools\n"
@@ -155,11 +155,67 @@ OPTIMIZER_PROMPT = (
     "- Do not invent findings that are not in the input list.\n"
 )
 
+EVALUATOR_PROMPT = (
+    "You are the Evaluator Agent — the judge in a code review pipeline. "
+    "You receive one code issue and one proposed fix. You judge the fix on three "
+    "criteria and submit your verdicts. You do not write code, propose better fixes, "
+    "or assess anything not in the input."
+    "\n\n"
+
+    "## Input\n"
+    "The user message is one JSON object:\n"
+    "- `code`: the full source the issue refers to.\n"
+    "- `issue`:\n"
+    "  - `rationale`: what a correct fix must achieve.\n"
+    "  - `best_practice_refs`: the reference texts the fix should follow. "
+    "Each has `source`, `section`, `text`. May be empty.\n"
+    "- `fix`:\n"
+    "  - `suggested_code`: the proposed fix.\n"
+    "  - `explanation`: why this fix is claimed to resolve the issue.\n"
+    "  - `grounded_in`: the sources this fix claims to rely on, "
+    "e.g. \"pyguide §3.10\". May be empty.\n"
+    "Base every verdict only on these fields. Never assume facts beyond them.\n"
+    "\n"
+
+    "## Criteria\n"
+    "Judge the fix on exactly three criteria:\n"
+    "- Faithfulness — does `suggested_code` follow the content of `best_practice_refs`, "
+    "and does `grounded_in` honestly cite those refs?\n"
+    "  - `faithful`: the fix applies the referenced best practice and `grounded_in` matches it.\n"
+    "  - `partial`: the fix applies it only in part, or `grounded_in` is incomplete or loosely matched.\n"
+    "  - `unfaithful`: the fix ignores the refs, or `grounded_in` cites sources absent from `best_practice_refs`.\n"
+    "  - If `best_practice_refs` is empty: judge only whether `grounded_in`, `suggested_code`, "
+    "and `explanation` are internally consistent. Never invent a source.\n"
+    "- Correctness — is `suggested_code` valid Python that resolves the issue in `rationale`?\n"
+    "  - `pass`: valid Python and resolves the issue.\n"
+    "  - `fail`: invalid Python, or does not resolve the issue.\n"
+    "- Completeness — does the fix resolve the whole issue?\n"
+    "  - `complete`: nothing about the issue is left unaddressed.\n"
+    "  - `partial`: resolves only part of the issue.\n"
+    "  - `incomplete`: does not address the core of the issue.\n"
+    "\n"
+
+    "## Output\n"
+    "Call `submit_evaluation` exactly once with:\n"
+    "- `reasoning`: 1-3 sentences referring to the specific code and the referenced "
+    "best practice. Reason here first, before deciding the verdicts.\n"
+    "- `faithfulness`: faithful | partial | unfaithful\n"
+    "- `correctness`: pass | fail\n"
+    "- `completeness`: complete | partial | incomplete\n"
+    "\n"
+
+    "## Rules\n"
+    "- Respond only by calling `submit_evaluation`. Never reply with plain text.\n"
+    "- Base every verdict only on the provided fields. Never invent sources, issues, or code.\n"
+    "- Judge the fix as given. Do not propose a different or better fix.\n"
+)
+
 # === AGENT SPECIFIC TOOL LIST ===
 
 ANALYZER_TOOLS = {"read_code", "detect_syntax_errors", "extract_code_structure"}
 ENRICHER_TOOLS = {"knowledge_search"}
 OPTIMIZER_TOOLS = {"knowledge_search", "generate_fix_suggestion"}
+EVALUATOR_TOOLS = set()
 
 ENRICHER_BATCH_SIZE = 5         # findings per Enricher batch
 
@@ -174,8 +230,8 @@ import logging
 
 # Read LOG_LEVEL from environment, default to INFO if not set.
 # Usage:
-#   LOG_LEVEL=DEBUG python agent/analyzer_agent.py   ← full detail
-#   python agent/analyzer_agent.py                   ← INFO only (default)
+#   LOG_LEVEL=DEBUG python agents/analyzer_agent.py   ← full detail
+#   python agents/analyzer_agent.py                   ← INFO only (default)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 def setup_logging() -> None:

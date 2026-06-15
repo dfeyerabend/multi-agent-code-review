@@ -60,7 +60,7 @@ def run_optimizer_tool(name: str, tool_input: dict) -> str:
 
     Args:
         name:       Name of the tool to execute.
-        tool_input: Dict of arguments passed by the agent.
+        tool_input: Dict of arguments passed by the agents.
 
     Returns:
         JSON string with status and validated optimization data, or an error message.

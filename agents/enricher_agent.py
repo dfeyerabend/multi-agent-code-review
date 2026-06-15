@@ -8,7 +8,7 @@ import asyncio
 import json
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from agent.agent_utils import convert_mcp_tools_to_anthropic, chunk_list
+from agents.agent_utils import convert_mcp_tools_to_anthropic, chunk_list
 
 import logging
 logger = logging.getLogger(__name__)
@@ -110,7 +110,7 @@ async def run_enricher(findings: list) -> dict:
 
 async def _run_enricher_batch(findings_batch: list, session: ClientSession, all_tools: list) -> dict:
     """
-    Runs the Enricher agent loop on a single batch of findings.
+    Runs the Enricher agents loop on a single batch of findings.
 
     Args:
         findings_batch: Subset of findings/issues for this iteration.

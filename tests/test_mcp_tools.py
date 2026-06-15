@@ -1,6 +1,6 @@
 """
 Tests for MCP server tool functions.
-Tests import and call the tool functions directly — no MCP server or agent needed.
+Tests import and call the tool functions directly — no MCP server or agents needed.
 """
 
 import json

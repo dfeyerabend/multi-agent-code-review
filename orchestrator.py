@@ -1,6 +1,6 @@
 """
 Orchestrator — linear pipeline driver for the Code Review Agent.
-Owns full pipeline state. Builds each agent's input contract and passes forward only what that agent needs.
+Owns full pipeline state. Builds each agents's input contract and passes forward only what that agents needs.
 """
 
 import asyncio
@@ -9,9 +9,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from agent.analyzer_agent import run_analyzer
-from agent.enricher_agent import run_enricher
-from agent.optimizer_agent import run_optimizer
+from agents.analyzer_agent import run_analyzer
+from agents.enricher_agent import run_enricher
+from agents.optimizer_agent import run_optimizer
 
 # Fields the Enricher needs from each finding — everything else stays in the orchestrator.
 _ENRICHER_FIELDS = {"rule", "line", "category", "severity", "message", "doc_url", "cwe_id"}
@@ -19,7 +19,7 @@ _ENRICHER_FIELDS = {"rule", "line", "category", "severity", "message", "doc_url"
 
 async def run_pipeline(code_input: str) -> dict:
     """
-    Runs the code review pipeline from Analyzer through to the last built agent.
+    Runs the code review pipeline from Analyzer through to the last built agents.
 
     Args:
         code_input: File path or raw code string.

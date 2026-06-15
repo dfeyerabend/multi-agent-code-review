@@ -196,10 +196,10 @@ Log verbosity is controlled by a single environment variable:
 | `DEBUG` | Full tool inputs and outputs for tracing the agent loop |
 
 ```bash
-LOG_LEVEL=DEBUG python agent/analyzer_agent.py   # full trace
-python agent/analyzer_agent.py                   # clean output
-LOG_LEVEL=DEBUG python agent/enricher_agent.py   # full trace
-python agent/enricher_agent.py                   # clean output
+LOG_LEVEL=DEBUG python agents/analyzer_agent.py   # full trace
+python agents/analyzer_agent.py                   # clean output
+LOG_LEVEL=DEBUG python agents/enricher_agent.py   # full trace
+python agents/enricher_agent.py                   # clean output
 ```
 
 ---
@@ -215,7 +215,7 @@ python agent/enricher_agent.py                   # clean output
 
 ```bash
 git clone https://github.com/yourusername/multi-agent-code-review.git
-cd multi-agent-code-review
+cd multi-agents-code-review
 
 python -m venv .venv
 source .venv/bin/activate       # macOS/Linux
@@ -248,8 +248,8 @@ python orchestrator.py
 python orchestrator.py path/to/your_code.py
 
 # Run individual agents standalone
-python agent/analyzer_agent.py
-python agent/enricher_agent.py
+python agents/analyzer_agent.py
+python agents/enricher_agent.py
 ```
 ---
 
