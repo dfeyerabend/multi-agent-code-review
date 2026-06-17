@@ -58,8 +58,8 @@ Code Input (file path or raw string)
 | Enricher Agent | ✅ Done | Enriches findings with RAG context; batched to prevent context overflow |
 | Orchestrator | ✅ Done | Linear pipeline driver; owns pipeline state; builds per-agent input contracts |
 | Optimizer Agent | ✅ Done | Category-aware fix routing; Security/Logic/Maintainability processed individually, Style grouped by rule code |
-| Evaluator Agent | 🔲 Pending | LLM-as-Judge scoring + final report |
-| Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes |
+| Evaluator Agent | ✅ Done | LLM-as-Judge: judges each (finding, fix) pair, produces markdown report |
+| Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes (post-publish) |
 
 ---
 
@@ -76,6 +76,7 @@ A single MCP server (`code-review-mcp`) exposes all tools. Agents discover tools
 | `extract_code_structure`    | Extract functions, classes, imports | `ast.parse()` + `ast.walk()` |
 | `knowledge_search`          | RAG search for best-practice context | ChromaDB cosine similarity, metadata category filter |
 | `generate_fix_suggestion`   | Extract enclosing function source for a finding line | AST walk, falls back to surrounding lines on syntax error or module-level code |
+| `create_review_report`      | Format evaluated fixes into a markdown report | Builds category × status table + per-fix sections |
 
 ### Agent Design
 
@@ -115,16 +116,16 @@ Chunks are filtered by category metadata (Style, Logic, Maintainability, Securit
 
 ### Evaluation
 
-The Evaluator agent (LLM-as-Judge) scores the pipeline's output on five dimensions:
+The Evaluator Agent judges each (finding, fix) pair on three criteria:
 
-| Dimension | What it measures |
+| Criterion | Verdicts |
 |---|---|
-| Task Completion | Did every identified issue get a review? |
-| Tool Selection | Did agents use the right tools at the right time? |
-| Faithfulness | Are suggestions grounded in RAG context? |
-| Efficiency | Number of LLM calls per review (target: ≤ 6) |
-| Error Recovery | Graceful handling when RAG returns no results |
+| Faithfulness | Does `suggested_code` follow `best_practice_refs`? Does `grounded_in` cite them honestly? |
+| Correctness | Is `suggested_code` valid Python that resolves the issue? |
+| Completeness | Does the fix address the whole finding? |
 
+Status is derived deterministically in Python from the three verdicts — not by the LLM.
+`create_review_report` formats the results into a markdown report with a category × status overview table.
 ---
 
 ## Project Structure
@@ -136,7 +137,8 @@ multi-agent-code-review/
 │ ├── agent_utils.py                # Shared utilities (MCP tool format conversion, chunking)
 │ ├── analyzer_agent.py             # Analyzer agent
 │ └── enricher_agent.py             # Enricher agent (batched)
-│ └── optimizer_agent.py            # Optimizer agent (category-aware routing)
+│ ├── optimizer_agent.py            # Optimizer agent (category-aware routing)
+│ └── evaluator_agent.py            # Evaluator agent
 ├── knowledge_base/
 │ ├── create_database.py            # Run once to populate ChromaDB from documents
 │ ├── inspect_database.py           # Dev utility to inspect database contents
@@ -146,16 +148,18 @@ multi-agent-code-review/
 ├── tools/
 │ ├── init.py
 │ ├── analyzer_tools.py             # Local submit_analysis tool
-│ └── enricher_tools.py             # Local submit_enrichment tool
-│ └── optimizer_tools.py            # Local submit_optimization tool
+│ ├── enricher_tools.py             # Local submit_enrichment tool
+│ ├── optimizer_tools.py            # Local submit_optimization tool
+│ └── evaluator_tools.py
 ├── tests/
 │ ├── conftest.py
 │ ├── test_mcp_tools.py             # MCP tools + knowledge_search tests
 │ ├── test_analyzer_tools.py        # submit_analysis tests incl. deduplication
 │ ├── test_enricher_tools.py        # submit_enrichment schema validation tests
 │ ├── test_agent_utils.py           # chunk_list utility tests
-│ └── test_rag_retrieval.py
-│ └── test_optimizer_tools.py       # submit_optimization schema validation tests
+│ ├── test_rag_retrieval.py
+│ ├── test_optimizer_tools.py       # submit_optimization schema validation tests
+│ └── test_evaluator_tools.py       # submit_evaluation schema validation tests (pending)
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
 ├── orchestrator.py                 # Pipeline driver — Analyzer → Enricher → (Optimizer stub)

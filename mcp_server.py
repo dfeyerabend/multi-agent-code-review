@@ -571,7 +571,7 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
 
     Args:
         fixes_evaluated: List of evaluated fix dicts, each with finding_rule,
-                         finding_line, status, score, reasoning, suggested_code,
+                         finding_line, status, reasoning, suggested_code,
                          and grounded_in.
         summary:         Overall summary string produced by the Evaluator.
 
@@ -624,7 +624,6 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
             rule           = fix.get("finding_rule", "?")
             line           = fix.get("finding_line", "?")
             status         = fix.get("status", "?")
-            score          = fix.get("score", "?")
             reasoning      = fix.get("reasoning", "")
             suggested_code = fix.get("suggested_code", "")
             grounded_in    = fix.get("grounded_in", [])
@@ -638,7 +637,7 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
 
             lines += [
                 f"## {emoji} Rule `{rule}` — Line {line}",
-                f"**Status:** {status} | **Score:** {score}/5",
+                f"**Status:** {status}",
                 "",
                 f"**Reasoning:** {reasoning}",
                 "",

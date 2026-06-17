@@ -13,7 +13,7 @@ client = anthropic.Anthropic()
 
 
 # === CLAUDE SETTINGS ===
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096       # For structured tool output
 MAX_ITERATIONS = 10      # Max iterations for every agents
 
