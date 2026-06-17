@@ -183,6 +183,74 @@ def run_analyzer_tool(name: str, tool_input: dict) -> str:
                     "message": f"Missing required fields: {missing}",
                 })
 
+            if not isinstance(tool_input["code"], str):
+                return json.dumps({"status": "error", "message": "'code' must be a string."})
+
+            file_path = tool_input["file_path"]
+            if file_path is not None and not isinstance(file_path, str):
+                return json.dumps({"status": "error", "message": "'file_path' must be a string or null."})
+
+            if not isinstance(tool_input["line_count"], int):
+                return json.dumps({"status": "error", "message": "'line_count' must be an integer."})
+
+            if not isinstance(tool_input["summary"], str):
+                return json.dumps({"status": "error", "message": "'summary' must be a string."})
+
+            if not isinstance(tool_input["syntax_findings"], list):
+                return json.dumps({"status": "error", "message": "'syntax_findings' must be a list."})
+
+            if not isinstance(tool_input["security_findings"], list):
+                return json.dumps({"status": "error", "message": "'security_findings' must be a list."})
+
+            if not isinstance(tool_input["structure"], dict):
+                return json.dumps({"status": "error", "message": "'structure' must be an object."})
+
+            syntax_errors = []
+            for i, f in enumerate(tool_input["syntax_findings"]):
+                if not isinstance(f, dict):
+                    syntax_errors.append(f"syntax_findings[{i}]: must be an object, got {type(f).__name__}")
+                    continue
+                if not isinstance(f.get("rule"), str):
+                    syntax_errors.append(f"syntax_findings[{i}]: 'rule' must be a string")
+                if not isinstance(f.get("message"), str):
+                    syntax_errors.append(f"syntax_findings[{i}]: 'message' must be a string")
+                if not isinstance(f.get("line"), int):
+                    syntax_errors.append(f"syntax_findings[{i}]: 'line' must be an integer")
+                if not isinstance(f.get("severity"), str):
+                    syntax_errors.append(f"syntax_findings[{i}]: 'severity' must be a string")
+
+            security_errors = []
+            for i, f in enumerate(tool_input["security_findings"]):
+                if not isinstance(f, dict):
+                    security_errors.append(f"security_findings[{i}]: must be an object, got {type(f).__name__}")
+                    continue
+                if not isinstance(f.get("test_id"), str):
+                    security_errors.append(f"security_findings[{i}]: 'test_id' must be a string")
+                if not isinstance(f.get("test_name"), str):
+                    security_errors.append(f"security_findings[{i}]: 'test_name' must be a string")
+                if not isinstance(f.get("message"), str):
+                    security_errors.append(f"security_findings[{i}]: 'message' must be a string")
+                if not isinstance(f.get("line"), int):
+                    security_errors.append(f"security_findings[{i}]: 'line' must be an integer")
+                if not isinstance(f.get("severity"), str):
+                    security_errors.append(f"security_findings[{i}]: 'severity' must be a string")
+                if not isinstance(f.get("confidence"), str):
+                    security_errors.append(f"security_findings[{i}]: 'confidence' must be a string")
+
+            structure_errors = []
+            structure = tool_input["structure"]
+            for key in ("functions", "classes", "imports"):
+                if not isinstance(structure.get(key), list):
+                    structure_errors.append(f"structure.{key} must be a list")
+
+            all_errors = syntax_errors + security_errors + structure_errors
+            if all_errors:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Analysis fields failed validation. Correct and resubmit.",
+                    "errors": all_errors,
+                })
+
             # Deduplicate issues -> each issue becomes one entry with multiple associated code lines
             # Done so that the Enricher does only one RAG lookup per rule, not per occurrence
             deduped_syntax = _deduplicate_findings(tool_input.get("syntax_findings", []))

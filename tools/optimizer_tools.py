@@ -81,6 +81,30 @@ def run_optimizer_tool(name: str, tool_input: dict) -> str:
                     "message": "'fixes' must be a list.",
                 })
 
+            fix_errors = []
+            for i, fix in enumerate(tool_input["fixes"]):
+                if not isinstance(fix, dict):
+                    fix_errors.append(f"fixes[{i}]: must be an object, got {type(fix).__name__}")
+                    continue
+                if not isinstance(fix.get("finding_rule"), str):
+                    fix_errors.append(f"fixes[{i}]: 'finding_rule' must be a string")
+                if not isinstance(fix.get("finding_line"), int):
+                    fix_errors.append(f"fixes[{i}]: 'finding_line' must be an integer")
+                if "suggested_code" in fix and fix["suggested_code"] is not None and not isinstance(
+                        fix["suggested_code"], str):
+                    fix_errors.append(f"fixes[{i}]: 'suggested_code' must be a string or null")
+                if not isinstance(fix.get("explanation"), str):
+                    fix_errors.append(f"fixes[{i}]: 'explanation' must be a string")
+                if not isinstance(fix.get("grounded_in"), list):
+                    fix_errors.append(f"fixes[{i}]: 'grounded_in' must be a list")
+
+            if fix_errors:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Fix entries failed validation. Correct and resubmit.",
+                    "errors": fix_errors,
+                })
+
             return json.dumps({
                 "status": "success",
                 "optimization_results": tool_input,

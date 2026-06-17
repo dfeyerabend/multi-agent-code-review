@@ -98,6 +98,62 @@ def run_enricher_tool(name: str, tool_input: dict) -> str:
                     "message": "'findings' must be a list.",
                 })
 
+            if not isinstance(tool_input["summary"], str):
+                return json.dumps({
+                    "status": "error",
+                    "message": "'summary' must be a string.",
+                })
+
+            if not isinstance(tool_input["rag_used"], bool):
+                return json.dumps({
+                    "status": "error",
+                    "message": "'rag_used' must be a boolean.",
+                })
+
+            # Verifies that the output contains the correct formats
+            finding_errors = []
+            for i, finding in enumerate(tool_input["findings"]):
+                if not isinstance(finding, dict):
+                    finding_errors.append(f"findings[{i}]: must be an object, got {type(finding).__name__}")
+                    continue
+                if not isinstance(finding.get("rule"), str):
+                    finding_errors.append(f"findings[{i}]: 'rule' must be a string")
+                if not isinstance(finding.get("line"), int):
+                    finding_errors.append(f"findings[{i}]: 'line' must be an integer")
+                if not isinstance(finding.get("category"), str):
+                    finding_errors.append(f"findings[{i}]: 'category' must be a string")
+                if not isinstance(finding.get("severity"), str):
+                    finding_errors.append(f"findings[{i}]: 'severity' must be a string")
+                if not isinstance(finding.get("rationale"), str):
+                    finding_errors.append(f"findings[{i}]: 'rationale' must be a string")
+                if not isinstance(finding.get("best_practice_refs"), list):
+                    finding_errors.append(f"findings[{i}]: 'best_practice_refs' must be a list")
+                else:
+                    for j, ref in enumerate(finding["best_practice_refs"]):
+                        if not isinstance(ref, dict):
+                            finding_errors.append(
+                                f"findings[{i}].best_practice_refs[{j}]: must be an object, got {type(ref).__name__}")
+                            continue
+                        if not isinstance(ref.get("source"), str):
+                            finding_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'source' must be a string")
+                        if not isinstance(ref.get("section"), str):
+                            finding_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'section' must be a string")
+                        if not isinstance(ref.get("text"), str):
+                            finding_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'text' must be a string")
+                doc_url = finding.get("doc_url")
+                if doc_url is not None and not isinstance(doc_url, str):
+                    finding_errors.append(f"findings[{i}]: 'doc_url' must be a string or null")
+                cwe_id = finding.get("cwe_id")
+                if cwe_id is not None and not isinstance(cwe_id, int):
+                    finding_errors.append(f"findings[{i}]: 'cwe_id' must be an integer or null")
+
+            if finding_errors:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Finding entries failed validation. Correct and resubmit.",
+                    "errors": finding_errors,
+                })
+
             return json.dumps({
                 "status": "success",
                 "enrichment_results": tool_input,

@@ -79,6 +79,12 @@ def run_evaluator_tool(name: str, tool_input: dict) -> str:
                 "message": f"submit_evaluation failed — missing required fields: {missing}",
             })
 
+        if not isinstance(tool_input["reasoning"], str):
+            return json.dumps({
+                "status": "error",
+                "message": f"submit_evaluation failed — 'reasoning' must be a string, got {type(tool_input['reasoning']).__name__}",
+            })
+
         # Check if LLM used the correct scoring schema
         enums = {
             "faithfulness": _FAITHFULNESS,
