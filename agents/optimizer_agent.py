@@ -33,6 +33,236 @@ from tools.optimizer_tools import (
 
 LOCAL_TOOL_NAMES = {t["name"] for t in optimizer_local_tools}
 
+# === HELPER FUNCTIONS ===
+
+def _route_findings(findings: list) -> tuple[list, dict[str, list]]:
+    """
+    Splits findings into individual and grouped buckets for routing.
+
+    Pipeline: called once by run_optimizer after MCP session opens, before
+    any LLM calls. Determines which findings get their own call and which
+    are batched together by rule code.
+
+    Style findings are grouped by rule code so all instances of the same
+    rule (e.g. 20 × W291) are resolved in one LLM call. Security, Logic,
+    and Maintainability findings get individual calls by default — mixed
+    context degrades fix quality for complex issues.
+
+    Config overrides (OPTIMIZER_FORCE_GROUPED / OPTIMIZER_FORCE_INDIVIDUAL)
+    let specific rule IDs opt out of the default without changing this logic.
+
+    Args:
+        findings: List of enriched finding dicts from the Enricher.
+
+    Returns:
+        Tuple of:
+        - individual_findings: flat list, one LLM call each.
+        - style_groups: dict mapping rule_code → list of findings,
+          one LLM call per group (chunked later at OPTIMIZER_STYLE_BATCH_SIZE).
+        Returns ([], {}) on invalid input or unexpected failure.
+    """
+    if not isinstance(findings, list):
+        logger.error("_route_findings: findings must be a list, got %s", type(findings).__name__)
+        return [], {}
+
+    try:
+        individual_findings = []
+        style_groups: dict[str, list] = {}
+
+        for finding in findings:
+            if not isinstance(finding, dict):  # a non-dict finding cannot be routed — skip rather than crash the whole batch
+                logger.warning("_route_findings: skipping non-dict finding: %s", type(finding).__name__)
+                continue
+
+            category  = finding.get("category", "")
+            rule_code = finding.get("rule", "unknown")
+
+            if category == "Style" and rule_code not in OPTIMIZER_FORCE_INDIVIDUAL:
+                style_groups.setdefault(rule_code, []).append(finding)
+
+            elif category != "Style" and rule_code in OPTIMIZER_FORCE_GROUPED:
+                # Config override: treat this Security/Logic/Maintainability rule as grouped
+                style_groups.setdefault(rule_code, []).append(finding)
+
+            else:
+                individual_findings.append(finding)
+
+        logger.info(
+            "_route_findings: %d individual | %d style group(s) covering %d finding(s)",
+            len(individual_findings),
+            len(style_groups),
+            sum(len(v) for v in style_groups.values()),
+        )
+        return individual_findings, style_groups
+
+    except Exception as e:
+        logger.error("_route_findings failed unexpectedly: %s", str(e))
+        return [], {}
+
+
+def _extract_final_output(messages: list, final_response) -> dict:
+    """
+    Extracts the submit_optimization result from the conversation history.
+
+    Pipeline: called by _run_optimizer_batch once the model stops with
+    stop_reason='end_turn' (i.e. after it called submit_optimization).
+
+    Args:
+        messages:       Full conversation message list.
+        final_response: The last response object from the Anthropic API (fallback source only).
+
+    Returns:
+        dict containing the validated optimization output, or error info.
+    """
+    if not isinstance(messages, list):
+        logger.error("_extract_final_output: messages must be a list, got %s", type(messages).__name__)
+        return {"status": "error", "message": f"Invalid input: messages must be list, got {type(messages).__name__}"}
+
+    try:
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                for block in msg["content"]:
+                    if block.get("type") == "tool_result":
+                        try:
+                            result = json.loads(block["content"])
+                            if result.get("status") == "success" and "optimization_results" in result:
+                                return result
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+        # no valid tool_result found — attempt to parse the raw text response as a fallback
+        final_text = ""
+        for block in final_response.content:
+            if hasattr(block, "text"):
+                final_text += block.text
+
+        try:
+            return json.loads(final_text)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse final output — raw: %s", final_text[:200])
+            return {"status": "error", "raw_output": final_text}
+
+    except Exception as e:
+        logger.error("_extract_final_output failed unexpectedly: %s", str(e))
+        return {"status": "error", "message": f"Unexpected error extracting output: {str(e)}"}
+
+
+async def _run_optimizer_batch(
+    code: str,
+    findings_batch: list,
+    session: ClientSession,
+    all_tools: list,
+) -> dict:
+    """
+    Runs the Optimizer agent loop on a single batch of findings.
+
+    Pipeline: called by run_optimizer_single (one finding) and
+    run_optimizer_group (one rule-code chunk). Each call is fully
+    independent — no shared state between batches.
+
+    Args:
+        code:           Full source code string, passed once per batch.
+        findings_batch: Subset of enriched findings for this iteration.
+        session:        Active MCP client session, shared across all batches.
+        all_tools:      Combined MCP + local tool list, built once by the wrapper.
+
+    Returns:
+        dict with fix suggestions for this batch, or error info.
+        Status is 'max_iterations_reached' when the loop exhausts its budget
+        (predictable end-state), or 'error' for unexpected failures.
+    """
+    if not isinstance(code, str):
+        logger.error("_run_optimizer_batch: code must be a str, got %s", type(code).__name__)
+        return {"status": "error", "message": f"Invalid input: code must be str, got {type(code).__name__}"}
+
+    if not isinstance(findings_batch, list):
+        logger.error("_run_optimizer_batch: findings_batch must be a list, got %s", type(findings_batch).__name__)
+        return {"status": "error", "message": f"Invalid input: findings_batch must be list, got {type(findings_batch).__name__}"}
+
+    if not findings_batch:
+        logger.warning("_run_optimizer_batch: received empty findings_batch — nothing to process")
+        return {"status": "error", "message": "Empty findings_batch — nothing to process"}
+
+    if not isinstance(all_tools, list):
+        logger.error("_run_optimizer_batch: all_tools must be a list, got %s", type(all_tools).__name__)
+        return {"status": "error", "message": f"Invalid input: all_tools must be list, got {type(all_tools).__name__}"}
+
+    try:
+        batch_input = {
+            "code": code,
+            "findings": findings_batch,
+        }
+        messages = [{"role": "user", "content": json.dumps(batch_input, indent=2)}]
+
+        for iteration in range(MAX_ITERATIONS):
+            logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
+
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=OPTIMIZER_PROMPT,
+                tools=all_tools,
+                messages=messages,
+            )
+
+            logger.debug("Stop reason: %s", response.stop_reason)
+
+            if response.stop_reason == "end_turn":
+                final_output = _extract_final_output(messages, response)
+                logger.info("Batch completed after %d iteration(s)", iteration + 1)
+                return final_output
+
+            elif response.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": response.content})
+
+                tool_results = []
+                for block in response.content:
+                    if hasattr(block, "text") and block.text:
+                        logger.debug("Claude says: %s", block.text[:200])
+
+                    if block.type == "tool_use":
+                        logger.debug("Tool call: %s | args: %s", block.name, str(block.input)[:200])
+                        tool_name = block.name
+                        tool_args = block.input
+
+                        if tool_name in LOCAL_TOOL_NAMES:
+                            logger.debug("Calling tool: %s (local)", tool_name)
+                            tool_output = run_optimizer_tool(tool_name, tool_args)
+                        else:
+                            logger.debug("Calling tool: %s (MCP)", tool_name)
+                            try:
+                                result = await session.call_tool(tool_name, arguments=tool_args)
+                                tool_output = result.content[0].text if result.content else ""
+                            except Exception as e:
+                                tool_output = json.dumps({"status": "error", "message": str(e)})
+                                logger.warning("Tool error on %s: %s", tool_name, e)
+
+                        logger.debug("Tool result for %s: %s", tool_name, tool_output[:300])
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": tool_output,
+                        })
+
+                messages.append({"role": "user", "content": tool_results})
+
+        # loop exhausted without a valid submit_optimization call — expected budget failure, not a bug
+        logger.warning("Reached max iterations (%d) without valid output", MAX_ITERATIONS)
+        return {
+            "status": "max_iterations_reached",
+            "message": "Max iterations reached without valid output",
+        }
+
+    except Exception as e:
+        # unexpected: Anthropic API error, network failure, malformed response object, etc.
+        logger.error("Unexpected error in _run_optimizer_batch: %s", str(e))
+        return {
+            "status": "error",
+            "message": f"Unexpected error — likely API or network failure: {str(e)}",
+        }
+
+
+# === AGENT LOOP ===
 
 async def run_optimizer_single(
     finding: dict,
@@ -56,7 +286,23 @@ async def run_optimizer_single(
     Returns:
         dict with fix output for this finding, or error info.
     """
-    return await _run_optimizer_batch(code, [finding], session, all_tools)
+    if not isinstance(finding, dict):
+        logger.error("run_optimizer_single: finding must be a dict, got %s", type(finding).__name__)
+        return {"status": "error", "message": f"Invalid input: finding must be dict, got {type(finding).__name__}"}
+
+    if not isinstance(code, str):
+        logger.error("run_optimizer_single: code must be a str, got %s", type(code).__name__)
+        return {"status": "error", "message": f"Invalid input: code must be str, got {type(code).__name__}"}
+
+    if not isinstance(all_tools, list):
+        logger.error("run_optimizer_single: all_tools must be a list, got %s", type(all_tools).__name__)
+        return {"status": "error", "message": f"Invalid input: all_tools must be list, got {type(all_tools).__name__}"}
+
+    try:
+        return await _run_optimizer_batch(code, [finding], session, all_tools)
+    except Exception as e:
+        logger.error("run_optimizer_single failed unexpectedly: %s", str(e))
+        return {"status": "error", "message": f"Unexpected error in run_optimizer_single: {str(e)}"}
 
 
 async def run_optimizer_group(
@@ -80,7 +326,27 @@ async def run_optimizer_group(
     Returns:
         dict with fix output for this group, or error info.
     """
-    return await _run_optimizer_batch(code, findings, session, all_tools)
+    if not isinstance(findings, list):
+        logger.error("run_optimizer_group: findings must be a list, got %s", type(findings).__name__)
+        return {"status": "error", "message": f"Invalid input: findings must be list, got {type(findings).__name__}"}
+
+    if not findings:
+        logger.warning("run_optimizer_group: received empty findings list — nothing to process")
+        return {"status": "error", "message": "Empty findings list — nothing to process"}
+
+    if not isinstance(code, str):
+        logger.error("run_optimizer_group: code must be a str, got %s", type(code).__name__)
+        return {"status": "error", "message": f"Invalid input: code must be str, got {type(code).__name__}"}
+
+    if not isinstance(all_tools, list):
+        logger.error("run_optimizer_group: all_tools must be a list, got %s", type(all_tools).__name__)
+        return {"status": "error", "message": f"Invalid input: all_tools must be list, got {type(all_tools).__name__}"}
+
+    try:
+        return await _run_optimizer_batch(code, findings, session, all_tools)
+    except Exception as e:
+        logger.error("run_optimizer_group failed unexpectedly: %s", str(e))
+        return {"status": "error", "message": f"Unexpected error in run_optimizer_group: {str(e)}"}
 
 
 async def run_optimizer(code: str, enriched_findings: list) -> dict:
@@ -102,8 +368,17 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
 
     Returns:
         dict with merged fix suggestions across all findings, or error info.
+        Always returns a structured dict — never raises.
     """
-    if not enriched_findings:
+    if not isinstance(code, str):
+        logger.error("run_optimizer: code must be a str, got %s", type(code).__name__)
+        return {"status": "error", "message": f"Invalid input: code must be str, got {type(code).__name__}"}
+
+    if not isinstance(enriched_findings, list):
+        logger.error("run_optimizer: enriched_findings must be a list, got %s", type(enriched_findings).__name__)
+        return {"status": "error", "message": f"Invalid input: enriched_findings must be list, got {type(enriched_findings).__name__}"}
+
+    if not enriched_findings:           # legitimate path: analyzer found no issues in clean code (Test Case 2)
         return {
             "status": "success",
             "optimization_results": {"fixes": [], "summary": "No findings to optimize."},
@@ -156,20 +431,36 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
 
                     if result.get("status") != "success":
                         logger.error(
-                            "Individual call failed for rule %s line %s after max iterations — skipping. Reason: %s",
+                            "Individual call failed for rule %s line %s — skipping. Reason: %s",
                             finding.get("rule"), finding.get("line"), result.get("message"),
                         )
                         all_fixes.append({
                             "finding_rule": finding.get("rule"),
                             "finding_line": finding.get("line"),
                             "suggested_code": None,
-                            "explanation": f"Optimizer failed after max iterations: {result.get('message', 'unknown error')}",
+                            "explanation": f"Optimizer failed: {result.get('message', 'unknown error')}",
                             "grounded_in": [],
                         })
                         failed_count += 1
                         continue
 
-                    all_fixes.extend(result["optimization_results"]["fixes"])
+                    fixes = result.get("optimization_results", {}).get("fixes")
+                    if not isinstance(fixes, list):     # internal contract violation — silently extending with a non-list would corrupt all_fixes
+                        logger.error(
+                            "Individual call for rule %s returned malformed fixes — expected list, got %s",
+                            finding.get("rule"), type(fixes).__name__,
+                        )
+                        all_fixes.append({
+                            "finding_rule": finding.get("rule"),
+                            "finding_line": finding.get("line"),
+                            "suggested_code": None,
+                            "explanation": "Optimizer returned malformed output — no fixes list present.",
+                            "grounded_in": [],
+                        })
+                        failed_count += 1
+                        continue
+
+                    all_fixes.extend(fixes)
 
                 # --- Style groups ---
                 for rule_code, group_findings in style_groups.items():
@@ -187,7 +478,7 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
 
                         if result.get("status") != "success":
                             logger.error(
-                                "Style group '%s' chunk %d failed after max iterations — skipping. Reason: %s",
+                                "Style group '%s' chunk %d failed — skipping. Reason: %s",
                                 rule_code, j + 1, result.get("message"),
                             )
                             for finding in chunk:
@@ -195,13 +486,30 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                                     "finding_rule": finding.get("rule"),
                                     "finding_line": finding.get("line"),
                                     "suggested_code": None,
-                                    "explanation": f"Optimizer failed after max iterations: {result.get('message', 'unknown error')}",
+                                    "explanation": f"Optimizer failed: {result.get('message', 'unknown error')}",
                                     "grounded_in": [],
                                 })
                             failed_count += len(chunk)
                             continue
 
-                        all_fixes.extend(result["optimization_results"]["fixes"])
+                        fixes = result.get("optimization_results", {}).get("fixes")
+                        if not isinstance(fixes, list):     # internal contract violation — silently extending with a non-list would corrupt all_fixes
+                            logger.error(
+                                "Style group '%s' chunk %d returned malformed fixes — expected list, got %s",
+                                rule_code, j + 1, type(fixes).__name__,
+                            )
+                            for finding in chunk:
+                                all_fixes.append({
+                                    "finding_rule": finding.get("rule"),
+                                    "finding_line": finding.get("line"),
+                                    "suggested_code": None,
+                                    "explanation": "Optimizer returned malformed output — no fixes list present.",
+                                    "grounded_in": [],
+                                })
+                            failed_count += len(chunk)
+                            continue
+
+                        all_fixes.extend(fixes)
 
                 total = len(all_fixes)
                 summary = (
@@ -222,122 +530,16 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                         "failed_count": failed_count,
                     },
                 }
+
     except Exception as e:
-        logger.error("Optimizer failed to connect to MCP server: %s", str(e))
+        logger.error("run_optimizer failed — MCP connection or session error: %s", str(e))
         return {
             "status": "error",
             "message": f"MCP connection failed — likely mcp_server.py is missing or has a syntax error: {str(e)}",
         }
 
 
-async def _run_optimizer_batch(code: str, findings_batch: list, session: ClientSession, all_tools: list) -> dict:
-    """
-    Runs the Optimizer agents loop on a single batch of findings.
-
-    Args:
-        code:           Full source code string, passed once per batch.
-        findings_batch: Subset of enriched findings for this iteration.
-        session:        Active MCP client session, shared across all batches.
-        all_tools:      Combined MCP + local tool list, built once by the wrapper.
-
-    Returns:
-        dict with fix suggestions for this batch, or error info.
-    """
-    batch_input = {
-        "code": code,
-        "findings": findings_batch,
-    }
-    messages = [{"role": "user", "content": json.dumps(batch_input, indent=2)}]
-
-    for iteration in range(MAX_ITERATIONS):
-        logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
-
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=OPTIMIZER_PROMPT,
-            tools=all_tools,
-            messages=messages,
-        )
-
-        logger.debug("Stop reason: %s", response.stop_reason)
-
-        if response.stop_reason == "end_turn":
-            final_output = _extract_final_output(messages, response)
-            logger.info("Batch completed after %d iteration(s)", iteration + 1)
-            return final_output
-
-        elif response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-
-            tool_results = []
-            for block in response.content:
-                if hasattr(block, "text") and block.text:
-                    logger.debug("Claude says: %s", block.text[:200])
-
-                if block.type == "tool_use":
-                    logger.debug("Tool call: %s | args: %s", block.name, str(block.input)[:200])
-                    tool_name = block.name
-                    tool_args = block.input
-
-                    if tool_name in LOCAL_TOOL_NAMES:
-                        logger.debug("Calling tool: %s (local)", tool_name)
-                        tool_output = run_optimizer_tool(tool_name, tool_args)
-                    else:
-                        logger.debug("Calling tool: %s (MCP)", tool_name)
-                        try:
-                            result = await session.call_tool(tool_name, arguments=tool_args)
-                            tool_output = result.content[0].text if result.content else ""
-                        except Exception as e:
-                            tool_output = json.dumps({"status": "error", "message": str(e)})
-                            logger.warning("Tool error on %s: %s", tool_name, e)
-
-                    logger.debug("Tool result for %s: %s", tool_name, tool_output[:300])
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": tool_output,
-                    })
-
-            messages.append({"role": "user", "content": tool_results})
-
-    logger.warning("Reached max iterations (%d) without valid output", MAX_ITERATIONS)
-    return {"status": "error", "message": "Max iterations reached without valid output"}
-
-
-def _extract_final_output(messages: list, final_response) -> dict:
-    """
-    Extracts the submit_optimization result from the conversation history.
-
-    Args:
-        messages:       Full conversation message list.
-        final_response: The last response object from the Anthropic API.
-
-    Returns:
-        dict containing the validated optimization output, or error info.
-    """
-    for msg in reversed(messages):          # start from last message
-        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-            for block in msg["content"]:
-                if block.get("type") == "tool_result":
-                    try:
-                        result = json.loads(block["content"])
-                        if result.get("status") == "success" and "optimization_results" in result:
-                            return result
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-
-    final_text = ""
-    for block in final_response.content:
-        if hasattr(block, "text"):
-            final_text += block.text
-
-    try:
-        return json.loads(final_text)
-    except json.JSONDecodeError:
-        logger.error("Failed to parse final output — raw: %s", final_text[:200])
-        return {"status": "error", "raw_output": final_text}
-
+# === ENTRY POINT ===
 
 if __name__ == "__main__":
     from config import setup_logging
@@ -374,56 +576,3 @@ if __name__ == "__main__":
     print("FINAL OUTPUT:")
     print("=" * 60)
     print(json.dumps(result, indent=2))
-
-def _route_findings(
-    findings: list,
-) -> tuple[list, dict[str, list]]:
-    """
-    Splits findings into individual and grouped buckets for routing.
-
-    Pipeline: called once by run_optimizer after MCP session opens, before
-    any LLM calls. Determines which findings get their own call and which
-    are batched together by rule code.
-
-    Style findings are grouped by rule code so all instances of the same
-    rule (e.g. 20 × W291) are resolved in one LLM call. Security, Logic,
-    and Maintainability findings get individual calls by default — mixed
-    context degrades fix quality for complex issues.
-
-    Config overrides (OPTIMIZER_FORCE_GROUPED / OPTIMIZER_FORCE_INDIVIDUAL)
-    let specific rule IDs opt out of the default without changing this logic.
-
-    Args:
-        findings: List of enriched finding dicts from the Enricher.
-
-    Returns:
-        Tuple of:
-        - individual_findings: flat list, one LLM call each.
-        - style_groups: dict mapping rule_code → list of findings,
-          one LLM call per group (chunked later at OPTIMIZER_STYLE_BATCH_SIZE).
-    """
-    individual_findings = []
-    style_groups: dict[str, list] = {}
-
-    for finding in findings:
-        category  = finding.get("category", "")
-        rule_code = finding.get("rule", "unknown")
-
-        if category == "Style" and rule_code not in OPTIMIZER_FORCE_INDIVIDUAL:
-            # Group by rule code — all instances of the same Style rule in one call
-            style_groups.setdefault(rule_code, []).append(finding)
-
-        elif category != "Style" and rule_code in OPTIMIZER_FORCE_GROUPED:
-            # Config override: treat this Security/Logic/Maintainability rule as grouped
-            style_groups.setdefault(rule_code, []).append(finding)
-
-        else:
-            individual_findings.append(finding)
-
-    logger.info(
-        "_route_findings: %d individual | %d style group(s) covering %d finding(s)",
-        len(individual_findings),
-        len(style_groups),
-        sum(len(v) for v in style_groups.values()),
-    )
-    return individual_findings, style_groups
