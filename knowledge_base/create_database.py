@@ -21,7 +21,7 @@ COLLECTION_NAME = "code_best_practices"                             # single col
 
 SOURCES = {
     "pyguide.md": "pyguide",
-    "company_rules.md": "company",
+    "company_rules.md": "company_rules",
 }
 
 # --- Helpers ---
@@ -114,7 +114,7 @@ def create_database():
         documents = [_clean_text(chunk["content"]) for chunk in chunks]  # clean HTML noise before embedding
         metadatas = [
             {
-                "source": source_tag,                                   # 'pyguide' or 'company'
+                "source": source_tag,                                   # 'pyguide' or 'company_rules'
                 "section": _extract_section(chunk["heading"]),          # e.g. '3.10.4'
                 "title": chunk["heading"],                              # e.g. '3.10.4 Lambda Functions'
                 "category": _infer_category(chunk["heading"]),          # 'Style' | 'Logic' | 'Maintainability' | 'Security'

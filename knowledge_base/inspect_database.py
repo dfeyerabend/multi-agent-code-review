@@ -25,7 +25,7 @@ def inspect_database():
     total = collection.count()                                      # total number of chunks across all sources
     print(f"Collection '{COLLECTION_NAME}': {total} total chunks\n")
 
-    for source in ["pyguide", "company"]:                          # loop over known sources
+    for source in ["pyguide", "company_rules"]:                          # loop over known sources
 
         # fetch all entries for this source (documents + metadata)
         results = collection.get(
