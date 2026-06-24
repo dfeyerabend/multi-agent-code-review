@@ -1,135 +1,32 @@
 """
 Local tools for the Analyzer Agent.
 These are NOT on the MCP server — they run locally in the agents process.
-The submit_analysis tool enforces a strict output schema so the
-Enricher agents always gets consistent, structured input.
+submit_analysis only collects the Analyzer's own judgment (the summary).
+All deterministic data (findings, structure) is assembled in Python by
+run_analyzer directly from MCP tool outputs — never retyped by the LLM.
 """
 
 import json
-
-# === REUSABLE SCHEMA FRAGMENTS ===
-# Extracted to keep the main schema readable.
-# Each fragment defines the shape of one field in the analysis output.
-
-_syntax_finding_schema = {  # one ruff finding
-    "type": "object",
-    "properties": {
-        "rule": {"type": "string"},  # e.g. "F401", "E302"
-        "message": {"type": "string"},  # human-readable description
-        "line": {"type": "integer"},  # line number in code
-        "severity": {"type": "string"},  # HIGH / MEDIUM / LOW
-    }
-}
-
-_security_finding_schema = {  # one bandit finding
-    "type": "object",
-    "properties": {
-        "test_id": {"type": "string"},  # e.g. "B608"
-        "test_name": {"type": "string"},  # e.g. "hardcoded_sql_expressions"
-        "message": {"type": "string"},  # description of the issue
-        "line": {"type": "integer"},  # line number
-        "severity": {"type": "string"},  # HIGH / MEDIUM / LOW
-        "confidence": {"type": "string"},  # HIGH / MEDIUM / LOW
-    }
-}
-
-_function_schema = {  # one function from AST
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "line": {"type": "integer"},
-        "args": {"type": "array", "items": {"type": "string"}},
-        "has_docstring": {"type": "boolean"},
-    }
-}
-
-_class_schema = {  # one class from AST
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "line": {"type": "integer"},
-        "methods": {"type": "array", "items": {"type": "string"}},
-        "base_classes": {"type": "array", "items": {"type": "string"}},
-    }
-}
-
-_import_schema = {  # one import from AST
-    "type": "object",
-    "properties": {
-        "module": {"type": "string"},
-        "alias": {"type": ["string", "null"]},
-    }
-}
-
-_structure_schema = {  # combined code structure
-    "type": "object",
-    "description": "Code structure from extract_code_structure",
-    "properties": {  # all three go INSIDE properties
-        "functions": {
-            "type": "array",
-            "items": _function_schema,
-        },
-        "classes": {
-            "type": "array",
-            "items": _class_schema,
-        },
-        "imports": {
-            "type": "array",
-            "items": _import_schema,
-        },
-    }
-}
 
 # === TOOL SCHEMAS ===
 analyzer_local_tools = [
     {
         "name": "submit_analysis",
         "description": (
-            "Submit the final structured analysis after calling all three MCP tools "
+            "Submit your factual summary after calling all three MCP tools "
             "(read_code, detect_syntax_errors, extract_code_structure). "
             "You MUST call this tool as your final step. "
-            "Do NOT respond with plain text — always submit your findings through this tool."
+            "Do NOT respond with plain text — always submit through this tool."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {  # all fields INSIDE properties
-                "code": {
-                    "type": "string",
-                    "description": "The full original code string from read_code",
-                },
-                "file_path": {
-                    "type": ["string", "null"],  # nullable: null when raw code was passed
-                    "description": "File path if provided, null if raw code was passed",
-                },
-                "line_count": {
-                    "type": "integer",
-                    "description": "The number of lines in the code",
-                },
-                "syntax_findings": {
-                    "type": "array",
-                    "description": "Ruff findings from detect_syntax_errors. Empty list if clean.",
-                    "items": _syntax_finding_schema,
-                },
-                "security_findings": {
-                    "type": "array",
-                    "description": "Bandit findings from detect_syntax_errors. Empty list if clean.",
-                    "items": _security_finding_schema,
-                },
-                "structure": _structure_schema,
-                "summary": {  # summary INSIDE properties, not outside
+            "properties": {
+                "summary": {
                     "type": "string",
                     "description": "1-2 sentence factual overview of what the analysis found",
                 },
             },
-            "required": [  # required INSIDE input_schema, not outside
-                "code",
-                "file_path",
-                "line_count",
-                "syntax_findings",
-                "security_findings",
-                "structure",
-                "summary",
-            ],
+            "required": ["summary"],
         },
     }
 ]
@@ -140,20 +37,24 @@ def _deduplicate_findings(findings: list) -> list:
     """
     Collapses findings with the same rule code into a single entry.
 
+    Pipeline: called by run_analyzer (agents/analyzer_agent.py) when assembling
+    analysis_results from the detect_syntax_errors MCP output, before the
+    Enricher receives the findings.
+
     Args:
         findings: List of finding dicts from ruff or bandit.
 
     Returns:
-        Deduplicated list where each rule code appears once,
-        with all affected line numbers collected under 'lines'
-        and a count under 'occurrences'.
+        Deduplicated list where each rule code appears once. 'line' keeps the
+        first occurrence so downstream agents (Enricher, Optimizer) always
+        have a usable line number; 'lines' and 'occurrences' are added
+        alongside it for the full picture.
     """
     seen = {}
     for finding in findings:
         rule = finding.get("rule", "unknown")
         if rule not in seen:
             seen[rule] = {**finding, "lines": [finding.get("line")], "occurrences": 1}
-            seen[rule].pop("line", None)     # replace single 'line' with 'lines' list
         else:
             seen[rule]["lines"].append(finding.get("line"))
             seen[rule]["occurrences"] += 1
@@ -163,115 +64,41 @@ def _deduplicate_findings(findings: list) -> list:
 def run_analyzer_tool(name: str, tool_input: dict) -> str:
     """
     Executes local analyzer tools.
-    Currently only submit_analysis — but extensible for future tools.
-    """
 
+    Pipeline: called by run_analyzer (agents/analyzer_agent.py) inside the
+    agentic loop whenever the model invokes a tool name in LOCAL_TOOL_NAMES.
+
+    Args:
+        name:       Name of the local tool to execute.
+        tool_input: Dict of arguments passed by the model.
+
+    Returns:
+        JSON string with the validated summary on success, or a structured
+        error message naming the failing field.
+    """
     if name == "submit_analysis":
         try:
-            # Here we validates that required fields are present
-            # and return the data as clean JSON.
-            required_fields = [
-                "code", "file_path", "line_count",
-                "syntax_findings", "security_findings",
-                "structure", "summary",
-            ]
-
-            missing = [f for f in required_fields if f not in tool_input]
-            if missing:
+            if "summary" not in tool_input:
                 return json.dumps({
                     "status": "error",
-                    "message": f"Missing required fields: {missing}",
+                    "message": "Missing required field: 'summary'.",
                 })
-
-            if not isinstance(tool_input["code"], str):
-                return json.dumps({"status": "error", "message": "'code' must be a string."})
-
-            file_path = tool_input["file_path"]
-            if file_path is not None and not isinstance(file_path, str):
-                return json.dumps({"status": "error", "message": "'file_path' must be a string or null."})
-
-            if not isinstance(tool_input["line_count"], int):
-                return json.dumps({"status": "error", "message": "'line_count' must be an integer."})
 
             if not isinstance(tool_input["summary"], str):
-                return json.dumps({"status": "error", "message": "'summary' must be a string."})
-
-            if not isinstance(tool_input["syntax_findings"], list):
-                return json.dumps({"status": "error", "message": "'syntax_findings' must be a list."})
-
-            if not isinstance(tool_input["security_findings"], list):
-                return json.dumps({"status": "error", "message": "'security_findings' must be a list."})
-
-            if not isinstance(tool_input["structure"], dict):
-                return json.dumps({"status": "error", "message": "'structure' must be an object."})
-
-            syntax_errors = []
-            for i, f in enumerate(tool_input["syntax_findings"]):
-                if not isinstance(f, dict):
-                    syntax_errors.append(f"syntax_findings[{i}]: must be an object, got {type(f).__name__}")
-                    continue
-                if not isinstance(f.get("rule"), str):
-                    syntax_errors.append(f"syntax_findings[{i}]: 'rule' must be a string")
-                if not isinstance(f.get("message"), str):
-                    syntax_errors.append(f"syntax_findings[{i}]: 'message' must be a string")
-                if not isinstance(f.get("line"), int):
-                    syntax_errors.append(f"syntax_findings[{i}]: 'line' must be an integer")
-                if not isinstance(f.get("severity"), str):
-                    syntax_errors.append(f"syntax_findings[{i}]: 'severity' must be a string")
-
-            security_errors = []
-            for i, f in enumerate(tool_input["security_findings"]):
-                if not isinstance(f, dict):
-                    security_errors.append(f"security_findings[{i}]: must be an object, got {type(f).__name__}")
-                    continue
-                if not isinstance(f.get("test_id"), str):
-                    security_errors.append(f"security_findings[{i}]: 'test_id' must be a string")
-                if not isinstance(f.get("test_name"), str):
-                    security_errors.append(f"security_findings[{i}]: 'test_name' must be a string")
-                if not isinstance(f.get("message"), str):
-                    security_errors.append(f"security_findings[{i}]: 'message' must be a string")
-                if not isinstance(f.get("line"), int):
-                    security_errors.append(f"security_findings[{i}]: 'line' must be an integer")
-                if not isinstance(f.get("severity"), str):
-                    security_errors.append(f"security_findings[{i}]: 'severity' must be a string")
-                if not isinstance(f.get("confidence"), str):
-                    security_errors.append(f"security_findings[{i}]: 'confidence' must be a string")
-
-            structure_errors = []
-            structure = tool_input["structure"]
-            for key in ("functions", "classes", "imports"):
-                if not isinstance(structure.get(key), list):
-                    structure_errors.append(f"structure.{key} must be a list")
-
-            all_errors = syntax_errors + security_errors + structure_errors
-            if all_errors:
                 return json.dumps({
                     "status": "error",
-                    "message": "Analysis fields failed validation. Correct and resubmit.",
-                    "errors": all_errors,
+                    "message": f"'summary' must be a string, got {type(tool_input['summary']).__name__}.",
                 })
-
-            # Deduplicate issues -> each issue becomes one entry with multiple associated code lines
-            # Done so that the Enricher does only one RAG lookup per rule, not per occurrence
-            deduped_syntax = _deduplicate_findings(tool_input.get("syntax_findings", []))
-            deduped_security = _deduplicate_findings(tool_input.get("security_findings", []))
-
-            analysis = {**tool_input, "syntax_findings": deduped_syntax, "security_findings": deduped_security}
 
             return json.dumps({
                 "status": "success",
-                "analysis_results": analysis,
-                "metadata": {
-                    "total_syntax_findings": len(deduped_syntax),
-                    "total_security_findings": len(deduped_security),
-                    "total_findings": len(deduped_syntax) + len(deduped_security),
-                },
-            }, indent=2)
+                "summary": tool_input["summary"],
+            })
 
         except Exception as e:
             return json.dumps({
                 "status": "error",
-                "message": f"submit_analysis failed: {str(e)}",
+                "message": f"submit_analysis failed unexpectedly: {str(e)}",
             })
 
     else:

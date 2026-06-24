@@ -109,7 +109,17 @@ def _write_temp_file(code: str) -> str:
 # --- Helper: run a CLI tool and capture output ---
 def _run_cli_tool(command: list[str]) -> dict:
     """
-    Runs a CLI command, returns parsed JSON or error info.
+    Runs a CLI command in a detached subprocess, returns parsed JSON or error info.
+
+    Pipeline: helper used by detect_syntax_errors to invoke ruff and bandit.
+    Runs inside the MCP server process, which itself is a STDIO child of the agent.
+
+    Args:
+        command: Full argument vector, e.g. ["bandit", "-f", "json", "-q", path].
+
+    Returns:
+        dict with status "success" plus "data"/"raw_output", or status "error"
+        with a message naming the tool and the likely cause.
     """
 
     tool_name = command[0]
@@ -121,6 +131,7 @@ def _run_cli_tool(command: list[str]) -> dict:
             capture_output = True,                  # capture stdout and stderr
             text = True,                            # decode output as string
             timeout = 30,                           # fails if tool call does not work
+            stdin = subprocess.DEVNULL,             # detach the inherited JSON-RPC pipe: bandit's Python startup blocks on it otherwise
         )
 
         logger.debug("%s exit code: %d", tool_name, result.returncode)
@@ -143,13 +154,15 @@ def _run_cli_tool(command: list[str]) -> dict:
         }
 
     except FileNotFoundError:  # tool not installed or not in PATH
-        tool_name = command[0]
         return {
             "status": "error",
             "message": f"'{tool_name}' not found. Install with: pip install {tool_name}"
         }
     except subprocess.TimeoutExpired:
-        return {"status": "error", "message": "Tool timed out after 30 seconds"}
+        return {
+            "status": "error",
+            "message": f"{tool_name} timed out after 30 seconds",  # name the tool so a degraded scan is traceable
+        }
 
 # Help function to map ruff categories
 def _ruff_category(rule_code: str) -> str:
@@ -190,11 +203,20 @@ def detect_syntax_errors(code: str) -> str:
     """Runs static analysis on Python code using ruff (code quality)
     and bandit (security). Returns structured findings with severity.
 
+    Pipeline: MCP tool called by the Analyzer agent. Its output is assembled
+    into analysis_results by _assemble_analysis (agents/analyzer_agent.py).
+
     Args:
         code: Python source code as a string.
+
+    Returns:
+        JSON string. status is "clean" (no findings, both tools ran),
+        "issues_found" (findings present, both tools ran), or "partial"
+        (at least one tool failed — scan is incomplete and must not be
+        trusted as clean). tool_errors carries the per-tool failure messages.
     """
     logger.info("detect_syntax_errors called (%d lines)", len(code.splitlines()))
-    tmp_path = _write_temp_file(code)                   # Always gets passed a code string, because read_code translates already into string
+    tmp_path = _write_temp_file(code)
     logger.debug("Wrote temp file: %s", tmp_path)
 
     try:
@@ -211,7 +233,6 @@ def detect_syntax_errors(code: str) -> str:
             "--select", "E,F,W,C90,B",                  # Defined selection to ensure that only real errors are reported:
             tmp_path                                    # E=errors, F=pyflakes, W=warnings, C90=complexity, B=bugbear
         ])                                              # No S (Security) because this is handled by bandit
-
 
         if ruff_result["status"] == "success" and "data" in ruff_result:
             for issue in ruff_result["data"]:  # each issue is a dict with code, message, location
@@ -252,7 +273,7 @@ def detect_syntax_errors(code: str) -> str:
             for issue in bandit_data.get("results", []):
                 cwe = issue.get("issue_cwe") or {}
                 results["bandit"]["findings"].append({
-                    "rule": issue.get("test_id", ""),  # umbenannt von test_id für Konsistenz
+                    "rule": issue.get("test_id", ""),  # normalized from test_id to match ruff's 'rule' key
                     "tool": "bandit",
                     "test_name": issue.get("test_name", ""),
                     "message": issue.get("issue_text", ""),
@@ -280,13 +301,33 @@ def detect_syntax_errors(code: str) -> str:
                 len(results["ruff"]["findings"])
                 + len(results["bandit"]["findings"])
         )
-        logger.info("Analysis complete: %d total findings", total_findings)
+
+        # A failed tool makes the scan incomplete: a timed-out scanner with zero findings
+        # must NOT be indistinguishable from a genuinely clean scan, or a real issue
+        # (e.g. a missed security finding) silently disappears downstream.
+        tool_errors = {
+            tool: results[tool]["error"]
+            for tool in ("ruff", "bandit")
+            if results[tool]["error"] is not None
+        }
+
+        if tool_errors:
+            status = "partial"
+        elif total_findings == 0:
+            status = "clean"
+        else:
+            status = "issues_found"
+
+        logger.info("Analysis complete: %d findings, status=%s", total_findings, status)
+        if tool_errors:
+            logger.warning("detect_syntax_errors: incomplete scan — tool_errors: %s", tool_errors)
 
         return json.dumps({
-            "status": "clean" if total_findings == 0 else "issues_found",
+            "status": status,
             "total_findings": total_findings,
             "ruff_findings": len(results["ruff"]["findings"]),
             "bandit_findings": len(results["bandit"]["findings"]),
+            "tool_errors": tool_errors,             # empty dict when both tools ran cleanly
             "results": results
         }, indent=2)
 

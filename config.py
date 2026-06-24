@@ -47,14 +47,15 @@ ANALYZER_PROMPT = (
     "2. Take the `code` field from the read_code result.\n"
     "3. Call `detect_syntax_errors` with that code string.\n"
     "4. Call `extract_code_structure` with that code string.\n"
-    "5. Combine all results into your final JSON output.\n"
+    "5. Call `submit_analysis` with a 1-2 sentence factual summary of what you found. "
+    "Do not restate the findings or structure — those are handled automatically.\n"
     "\n"
 
     "## Rules\n"
     "- Only analyze Python code. If the input is clearly not Python, "
-    "call `submit_analysis` with empty findings and a summary explaining why.\n"
+    "call `submit_analysis` with a summary explaining why — the tools will report the parse failure.\n"
     "- Report ONLY what the tools find. Do NOT invent or hallucinate issues.\n"
-    "- If a tool returns no findings, pass an empty list `[]` — never fabricate problems.\n"
+    "- If the tools report no issues, say so plainly in your summary — never fabricate problems.\n"
     "- Your summary must be factual, not evaluative. You analyze — the Enricher adds context.\n"
 )
 

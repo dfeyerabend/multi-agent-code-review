@@ -1,11 +1,12 @@
 """
 Analyzer Agent — Step 1 in the Code Review Pipeline.
-Connects to the MCP server for code analysis tools,
-and uses a local submit_analysis tool for structured output.
+Connects to the MCP server for code analysis tools, and uses a local submit_analysis tool for the model's own summary.
+All deterministic data (findings, structure) is assembled in Python directly from MCP tool outputs — never retyped by the LLM.
 """
 
 import asyncio
 import json
+from typing import Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -26,6 +27,7 @@ from config import (
 from tools.analyzer_tools import (
     analyzer_local_tools,
     run_analyzer_tool,
+    _deduplicate_findings,
 )
 
 LOCAL_TOOL_NAMES = {t["name"] for t in analyzer_local_tools}
@@ -33,54 +35,133 @@ LOCAL_TOOL_NAMES = {t["name"] for t in analyzer_local_tools}
 
 # === HELPER FUNCTIONS ===
 
-def _extract_final_output(messages: list, final_response) -> dict:
+def _extract_summary(messages: list) -> Optional[str]:
     """
-    Pulls the submit_analysis result out of the conversation history.
+    Pulls the validated summary out of the conversation history.
 
-    Pipeline: called by run_analyzer once the model stops with
-    stop_reason='end_turn' (i.e. after it called submit_analysis).
+    Pipeline: called by run_analyzer once the model stops with stop_reason="end_turn"
+    (i.e. after it called submit_analysis).
 
     Args:
-        messages:       Full conversation message list for this agent run.
-        final_response: Last Anthropic API response object (fallback source only).
+        messages: Full conversation message list for this agent run.
 
     Returns:
-        dict with the validated analysis output, or error info.
+        The summary string if a successful submit_analysis result is found,
+        None if no valid result is present.
     """
-    if not isinstance(messages, list):
-        logger.error(
-            "_extract_final_output: messages must be a list, got %s",
-            type(messages).__name__,
-        )
-        return {"status": "error", "message": f"Invalid input: messages must be list, got {type(messages).__name__}"}
+    for msg in reversed(messages):
+        if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+            continue
+        for block in msg["content"]:
+            if block.get("type") != "tool_result":
+                continue
+            try:
+                result = json.loads(block["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if result.get("status") == "success" and "summary" in result:
+                return result["summary"]
+    return None
 
+
+def _assemble_analysis(mcp_outputs: dict, summary: str) -> dict:
+    """
+    Builds the final analysis_results dict directly from MCP tool outputs.
+
+    Pipeline: called by run_analyzer once the model has produced a valid summary
+    via submit_analysis. Replaces having the LLM retype linter/AST data — every
+    deterministic field here came verbatim from an MCP tool the agent already
+    called earlier in this same loop.
+
+    Args:
+        mcp_outputs: Parsed JSON results keyed by MCP tool name
+                     ("read_code", "detect_syntax_errors", "extract_code_structure").
+        summary:     The Analyzer's own factual summary from submit_analysis.
+
+    Returns:
+        dict with status "success" and "analysis_results"/"metadata" on success,
+        or status "error" naming the missing or failed tool output. metadata
+        carries scan_complete (False if a scanner failed) and tool_errors.
+    """
     try:
-        for msg in reversed(messages):
-            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-                for block in msg["content"]:
-                    if block.get("type") == "tool_result":
-                        try:
-                            result = json.loads(block["content"])
-                            if result.get("status") == "success" and "analysis_results" in result:
-                                return result
-                        except (json.JSONDecodeError, TypeError):
-                            continue
+        read_code_out = mcp_outputs.get("read_code")
+        syntax_out = mcp_outputs.get("detect_syntax_errors")
+        structure_out = mcp_outputs.get("extract_code_structure")
 
-        # submit_analysis result not found — raw text is the only remaining source
-        final_text = ""
-        for block in final_response.content:
-            if hasattr(block, "text"):
-                final_text += block.text
+        # All three are required inputs to the assembly — a missing one means the
+        # model never called that tool, which is a predictable agent failure, not a crash.
+        missing = [
+            name for name, out in [
+                ("read_code", read_code_out),
+                ("detect_syntax_errors", syntax_out),
+                ("extract_code_structure", structure_out),
+            ] if out is None
+        ]
+        if missing:
+            logger.warning("_assemble_analysis: model never called: %s", missing)
+            return {
+                "status": "error",
+                "message": f"Cannot assemble analysis — model never called: {missing}",
+            }
 
-        try:
-            return json.loads(final_text)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse final output — raw: %s", final_text[:200])
-            return {"status": "error", "raw_output": final_text}
+        if read_code_out.get("status") != "success":
+            return {
+                "status": "error",
+                "message": f"read_code did not succeed: {read_code_out.get('message')}",
+            }
+
+        if structure_out.get("status") != "success":
+            return {
+                "status": "error",
+                "message": f"extract_code_structure did not succeed: {structure_out.get('message')}",
+            }
+
+        results = syntax_out.get("results", {})
+        ruff_findings = results.get("ruff", {}).get("findings", [])
+        bandit_findings = results.get("bandit", {}).get("findings", [])
+
+        # Surface any scanner failure loudly. A failed security scan that produced zero
+        # findings must never be presented downstream as a trustworthy clean result —
+        # the pipeline still proceeds (ruff results stay useful), but the gap is recorded.
+        tool_errors = syntax_out.get("tool_errors") or {}
+        if tool_errors:
+            logger.warning("_assemble_analysis: incomplete scan — tool_errors: %s", tool_errors)
+
+        analysis_results = {
+            "code": read_code_out["code"],
+            "file_path": read_code_out.get("file_path"),
+            "line_count": read_code_out["line_count"],
+            "syntax_findings": _deduplicate_findings(ruff_findings),
+            "security_findings": _deduplicate_findings(bandit_findings),
+            "structure": {
+                "functions": structure_out.get("functions", []),
+                "classes": structure_out.get("classes", []),
+                "imports": structure_out.get("imports", []),
+            },
+            "summary": summary,
+        }
+
+        return {
+            "status": "success",
+            "analysis_results": analysis_results,
+            "metadata": {
+                "total_syntax_findings": len(analysis_results["syntax_findings"]),
+                "total_security_findings": len(analysis_results["security_findings"]),
+                "total_findings": (
+                    len(analysis_results["syntax_findings"])
+                    + len(analysis_results["security_findings"])
+                ),
+                "scan_complete": not tool_errors,       # False when ruff or bandit failed
+                "tool_errors": tool_errors,             # empty dict when both scanners ran
+            },
+        }
 
     except Exception as e:
-        logger.error("_extract_final_output failed unexpectedly: %s", str(e))
-        return {"status": "error", "message": f"Unexpected error extracting output: {str(e)}"}
+        logger.error("_assemble_analysis failed unexpectedly: %s", str(e))
+        return {
+            "status": "error",
+            "message": f"_assemble_analysis failed unexpectedly: {str(e)}",
+        }
 
 
 # === AGENT LOOP ===
@@ -116,7 +197,13 @@ async def run_analyzer(code_input: str) -> dict:
                 "structure": {"functions": [], "classes": [], "imports": []},
                 "summary": "No code provided.",
             },
-            "metadata": {"total_syntax_findings": 0, "total_security_findings": 0, "total_findings": 0},
+            "metadata": {
+                "total_syntax_findings": 0,
+                "total_security_findings": 0,
+                "total_findings": 0,
+                "scan_complete": True,
+                "tool_errors": {},
+            },
         }
 
     try:
@@ -139,6 +226,7 @@ async def run_analyzer(code_input: str) -> dict:
                 logger.info("Connected to MCP. Tools: %s", ", ".join(tool_summary))
 
                 messages = [{"role": "user", "content": code_input}]
+                mcp_outputs = {}  # captured verbatim per tool name, used by _assemble_analysis after the loop ends
 
                 for iteration in range(MAX_ITERATIONS):
                     logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
@@ -154,7 +242,15 @@ async def run_analyzer(code_input: str) -> dict:
                     logger.debug("Stop reason: %s", response.stop_reason)
 
                     if response.stop_reason == "end_turn":
-                        final_output = _extract_final_output(messages, response)
+                        summary = _extract_summary(messages)
+                        if summary is None:
+                            logger.warning("run_analyzer: ended turn without a valid submit_analysis result")
+                            return {
+                                "status": "error",
+                                "message": "Model ended turn without a valid submit_analysis call.",
+                            }
+
+                        final_output = _assemble_analysis(mcp_outputs, summary)
                         logger.info("Completed after %d iteration(s)", iteration + 1)
                         return final_output
 
@@ -175,6 +271,10 @@ async def run_analyzer(code_input: str) -> dict:
                                     try:
                                         result = await session.call_tool(block.name, arguments=block.input)
                                         tool_output = result.content[0].text if result.content else ""
+                                        try:
+                                            mcp_outputs[block.name] = json.loads(tool_output)  # captured for Python-side assembly, not for the LLM to retype
+                                        except json.JSONDecodeError:
+                                            logger.warning("Could not parse MCP output for %s as JSON", block.name)
                                     except Exception as e:
                                         tool_output = json.dumps({"status": "error", "message": str(e)})
                                         logger.warning("MCP tool %s failed: %s", block.name, str(e))
