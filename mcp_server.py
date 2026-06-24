@@ -35,6 +35,9 @@ def read_code(source: str) -> str:
     """
     Reads code from a file path or accepts a raw code string.
 
+    Pipeline: first tool called by the Analyzer Agent. Its output is assembled
+    into analysis_results by _assemble_analysis (agents/analyzer_agent.py).
+
     Args:
         source: Either a file path to a Python file, or a raw code string.
 
@@ -46,65 +49,97 @@ def read_code(source: str) -> str:
         - line_count: number of lines in the code
         - file_path: the resolved file path (only present for file input)
     """
-    logger.debug("read_code input (first 80 chars): %s", source[:80])
+    # source is model-supplied and drives os.path + string ops below; a non-string
+    # would raise uncaught before any logic runs, so reject it loudly first.
+    if not isinstance(source, str):
+        logger.error("read_code: source must be a str, got %s", type(source).__name__)
+        return json.dumps({
+            "status": "error",
+            "message": f"read_code failed — source must be a string, got {type(source).__name__}",
+        }, indent=2)
 
-    looks_like_path = "\n" not in source and source.strip().endswith(".py")
+    try:
+        logger.debug("read_code input (first 80 chars): %s", source[:80])
 
-    if looks_like_path:
-        if os.path.isfile(source):
-            try:
-                logger.debug("Detected file path: %s", source)
-                with open(source, "r", encoding = "utf-8") as f:
-                    code = f.read()
-                logger.info("File read successfully (%d lines)", len(code.splitlines()))
-                return json.dumps({
-                    "status": "success",
-                    "source_type": "file",
-                    "file_path": source,
-                    "code": code,
-                    "line_count": len(code.splitlines()), # useful for later agents
-                }, indent = 2)
-            except Exception as e:
-                logger.error("Failed to read file: %s", str(e))
+        looks_like_path = "\n" not in source and source.strip().endswith(".py")
+
+        if looks_like_path:
+            if os.path.isfile(source):
+                try:
+                    logger.debug("Detected file path: %s", source)
+                    with open(source, "r", encoding="utf-8") as f:
+                        code = f.read()
+                    logger.info("File read successfully (%d lines)", len(code.splitlines()))
+                    return json.dumps({
+                        "status": "success",
+                        "source_type": "file",
+                        "file_path": source,
+                        "code": code,
+                        "line_count": len(code.splitlines()),  # useful for later agents
+                    }, indent=2)
+                except Exception as e:
+                    logger.error("Failed to read file %s: %s", source, str(e))
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Failed to read file {source}: {str(e)}",
+                    }, indent=2)
+            else:
+                logger.warning("File path provided but not found: %s", source)
                 return json.dumps({
                     "status": "error",
-                    "message": f"Failed to read file: {str(e)}",
-                }, indent = 2)
-        else:
-            logger.warning("File path provided but not found: %s", source)
-            return json.dumps({
-                "status": "error",
-                "message": f"File not found: {source}",
-            }, indent=2)
+                    "message": f"File not found: {source}",
+                }, indent=2)
 
-    # no .py extension or contains newlines → treat as raw code
-    logger.debug("Detected raw code string (%d lines)", len(source.splitlines()))
-    return json.dumps({
-        "status": "success",
-        "source_type": "raw_string",
-        "code": source,
-        "line_count": len(source.splitlines()),
-    }, indent = 2)
+        # no .py extension or contains newlines → treat as raw code
+        logger.debug("Detected raw code string (%d lines)", len(source.splitlines()))
+        return json.dumps({
+            "status": "success",
+            "source_type": "raw_string",
+            "code": source,
+            "line_count": len(source.splitlines()),
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("read_code failed unexpectedly: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": f"read_code failed unexpectedly: {str(e)}",
+        }, indent=2)
 
 # --- Helper: write code to temp file for CLI tools ---
-def _write_temp_file(code: str) -> str:
+def _write_temp_file(code: str) -> str | None:
     """
     Writes code to a temporary .py file, returns the file path.
+
+    Pipeline: helper used by detect_syntax_errors before invoking ruff and bandit.
+
+    Args:
+        code: Python source code to write.
+
+    Returns:
+        The temp file path on success, or None on failure — the caller treats
+        None as a hard failure and reports it (this helper never raises).
     """
+    if not isinstance(code, str):
+        logger.error("_write_temp_file: code must be a str, got %s", type(code).__name__)
+        return None
 
-    tmp = tempfile.NamedTemporaryFile(      # create temp file that persists after close
-        mode = "w",
-        suffix = ".py",
-        delete = False,
-        encoding = "utf-8",
-    )
+    try:
+        tmp = tempfile.NamedTemporaryFile(      # persists after close so ruff/bandit can read it
+            mode="w",
+            suffix=".py",
+            delete=False,
+            encoding="utf-8",
+        )
+        tmp.write(code)
+        if not code.endswith("\n"):
+            tmp.write("\n")                     # prevent false W292 from the tempfile method
+        tmp.close()                             # close so ruff/bandit can read it
+        return tmp.name
 
-    tmp.write(code)
-    if not code.endswith("\n"):
-        tmp.write("\n")                     # prevent false W292 from tempfile method
-    tmp.close()                             # close so ruff/bandit can read it
-
-    return tmp.name
+    except Exception as e:
+        logger.error("_write_temp_file failed unexpectedly: %s", str(e))
+        return None
 
 # --- Helper: run a CLI tool and capture output ---
 def _run_cli_tool(command: list[str]) -> dict:
@@ -121,6 +156,12 @@ def _run_cli_tool(command: list[str]) -> dict:
         dict with status "success" plus "data"/"raw_output", or status "error"
         with a message naming the tool and the likely cause.
     """
+    if not isinstance(command, list) or not command:
+        logger.error("_run_cli_tool: command must be a non-empty list, got %r", command)
+        return {
+            "status": "error",
+            "message": f"_run_cli_tool failed — command must be a non-empty list, got {type(command).__name__}",
+        }
 
     tool_name = command[0]
     logger.debug("Executing: %s", " ".join(command[:4]))
@@ -128,10 +169,10 @@ def _run_cli_tool(command: list[str]) -> dict:
     try:
         result = subprocess.run(
             command,
-            capture_output = True,                  # capture stdout and stderr
-            text = True,                            # decode output as string
-            timeout = 30,                           # fails if tool call does not work
-            stdin = subprocess.DEVNULL,             # detach the inherited JSON-RPC pipe: bandit's Python startup blocks on it otherwise
+            capture_output=True,                    # capture stdout and stderr
+            text=True,                              # decode output as string
+            timeout=30,                             # fails if tool call does not work
+            stdin=subprocess.DEVNULL,               # detach the inherited JSON-RPC pipe: bandit's Python startup blocks on it otherwise
         )
 
         logger.debug("%s exit code: %d", tool_name, result.returncode)
@@ -162,6 +203,12 @@ def _run_cli_tool(command: list[str]) -> dict:
         return {
             "status": "error",
             "message": f"{tool_name} timed out after 30 seconds",  # name the tool so a degraded scan is traceable
+        }
+    except Exception as e:
+        logger.error("_run_cli_tool: %s failed unexpectedly: %s", tool_name, str(e))
+        return {
+            "status": "error",
+            "message": f"{tool_name} failed unexpectedly: {str(e)}",
         }
 
 # Help function to map ruff categories
@@ -215,8 +262,23 @@ def detect_syntax_errors(code: str) -> str:
         (at least one tool failed — scan is incomplete and must not be
         trusted as clean). tool_errors carries the per-tool failure messages.
     """
+    # code is model-supplied and feeds splitlines() + the scanners; reject a
+    # non-string before touching it, and before a temp file is ever created.
+    if not isinstance(code, str):
+        logger.error("detect_syntax_errors: code must be a str, got %s", type(code).__name__)
+        return json.dumps({
+            "status": "error",
+            "message": f"detect_syntax_errors failed — code must be a string, got {type(code).__name__}",
+        }, indent=2)
+
     logger.info("detect_syntax_errors called (%d lines)", len(code.splitlines()))
+
     tmp_path = _write_temp_file(code)
+    if tmp_path is None:  # write failed and already logged — nothing to clean up
+        return json.dumps({
+            "status": "error",
+            "message": "detect_syntax_errors failed — could not write temp file for ruff/bandit (see logs).",
+        }, indent=2)
     logger.debug("Wrote temp file: %s", tmp_path)
 
     try:
@@ -236,9 +298,9 @@ def detect_syntax_errors(code: str) -> str:
 
         if ruff_result["status"] == "success" and "data" in ruff_result:
             for issue in ruff_result["data"]:  # each issue is a dict with code, message, location
-                rule_code  = issue.get("code", "unknown")
+                rule_code = issue.get("code", "unknown")
                 results["ruff"]["findings"].append({
-                    "rule": rule_code ,
+                    "rule": rule_code,
                     "tool": "ruff",
                     "message": issue.get("message", ""),
                     "line": issue.get("location", {}).get("row"),
@@ -249,7 +311,6 @@ def detect_syntax_errors(code: str) -> str:
                     "fix_suggestion": issue.get("fix"),
                 })
 
-            # only report details when there are actual findings
             if results["ruff"]["findings"]:
                 logger.debug("Ruff findings: %s", results["ruff"]["findings"])
 
@@ -280,13 +341,12 @@ def detect_syntax_errors(code: str) -> str:
                     "line": issue.get("line_number"),
                     "severity": issue.get("issue_severity", "UNKNOWN"),
                     "confidence": issue.get("issue_confidence", "UNKNOWN"),
-                    "category": "Security", # bandit is always "Security"
+                    "category": "Security",  # bandit is always "Security"
                     "doc_url": issue.get("more_info"),
                     "cwe_id": cwe.get("id"),
                     "cwe_url": cwe.get("link"),
                 })
 
-            # only report details when there are actual findings
             if results["bandit"]["findings"]:
                 logger.debug("Bandit findings: %s", results["bandit"]["findings"])
 
@@ -331,96 +391,128 @@ def detect_syntax_errors(code: str) -> str:
             "results": results
         }, indent=2)
 
+    except Exception as e:
+        logger.error("detect_syntax_errors failed unexpectedly: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": f"detect_syntax_errors failed unexpectedly: {str(e)}",
+        }, indent=2)
+
     finally:
-        os.unlink(tmp_path)                             # always clean up temp file
+        # Cleanup must never crash the call — the file may already be gone.
+        try:
+            os.unlink(tmp_path)
+        except OSError as e:
+            logger.warning("detect_syntax_errors: could not remove temp file %s: %s", tmp_path, str(e))
 
 
 # --- TOOL 3: Extract Code Structure ---
 @mcp.tool()
 def extract_code_structure(code: str) -> str:
     """
-    Extracts functions, classes, and imports from Python code.
-    Uses ast (Abstract Syntax Tree)
+    Extracts functions, classes, and imports from Python code using ast.
+
+    Pipeline: MCP tool called by the Analyzer agent. Its output feeds the
+    'structure' field assembled by _assemble_analysis (agents/analyzer_agent.py).
 
     Args:
         code: Python source code as a string.
+
+    Returns:
+        JSON string with status, functions, classes, imports, and a summary
+        of counts, or a structured error if the code cannot be parsed.
     """
+    if not isinstance(code, str):
+        logger.error("extract_code_structure: code must be a str, got %s", type(code).__name__)
+        return json.dumps({
+            "status": "error",
+            "message": f"extract_code_structure failed — code must be a string, got {type(code).__name__}",
+        }, indent=2)
 
     logger.info("extract_code_structure called (%d lines)", len(code.splitlines()))
 
-    # Fail fast
     try:
-        tree = ast.parse(code)                                       # parse code into AST format (syntax tree)
-    except SyntaxError as e:                                         # if this fails, then the code does not follow a valid python structure
+        # Fail fast: invalid Python can't be walked — report the parse location.
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return json.dumps({
+                "status": "error",
+                "message": f"Cannot parse code: {e.msg} at line {e.lineno}"
+            }, indent=2)
+
+        functions = []
+        classes = []
+        imports = []
+
+        logger.debug("Parsing AST...")
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                # has_docstring requires three conditions to all hold; node.body can be
+                # empty, which would raise on body[0] — guard that with the trailing else.
+                functions.append({
+                    "name": node.name,
+                    "line": node.lineno,
+                    "args": [arg.arg for arg in node.args.args],
+                    "has_docstring": (
+                        isinstance(node.body[0], ast.Expr)
+                        and isinstance(node.body[0].value, ast.Constant)
+                        and isinstance(node.body[0].value.value, str)
+                    ) if node.body else False,
+                })
+
+            elif isinstance(node, ast.ClassDef):
+                methods = [
+                    n.name for n in node.body
+                    if isinstance(n, ast.FunctionDef)
+                ]
+                classes.append({
+                    "name": node.name,
+                    "line": node.lineno,
+                    "methods": methods,
+                    "base_classes": [
+                        getattr(base, "id", str(base))
+                        for base in node.bases
+                    ]
+                })
+
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports.append({
+                        "module": alias.name,
+                        "alias": alias.asname
+                    })
+
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    imports.append({
+                        "module": f"{node.module}.{alias.name}",
+                        "alias": alias.asname
+                    })
+
+        logger.debug("Functions: %s", functions)
+        logger.debug("Classes: %s", classes)
+        logger.debug("Imports: %s", imports)
+
         return json.dumps({
-            "status": "error",
-            "message": f"Cannot parse code: {e.msg} at line {e.lineno}"
+            "status": "success",
+            "functions": functions,
+            "classes": classes,
+            "imports": imports,
+            "summary": {
+                "function_count": len(functions),
+                "class_count": len(classes),
+                "import_count": len(imports)
+            }
         }, indent=2)
 
-    # Walk the AST and collect structural elements
-    functions = []
-    classes = []
-    imports = []
-
-    logger.debug("Parsing AST...")
-
-    for node in ast.walk(tree):                                     # visit every node in the tree
-        if isinstance(node, ast.FunctionDef):
-            functions.append({
-                "name": node.name,
-                "line": node.lineno,                                # catch line number of problem
-                "args": [arg.arg for arg in node.args.args],
-                "has_docstring": (
-                    isinstance(node.body[0], ast.Expr)                  # Three isinstance checks that all need to be TRUE for a clean docstring
-                    and isinstance(node.body[0].value, ast.Constant)    # Is first element an expression?; Is second element a parameter?; is the konstant a string?
-                    and isinstance(node.body[0].value.value, str)       # If all three are TRUE; THEN has_docstring ist True
-                ) if node.body else False                               # Savety logic if node.body does not exist, then  FALSE (would crash otherwise)
-            })
-
-        elif isinstance(node, ast.ClassDef):                        # Logic for method nodes
-            methods = [
-                n.name for n in node.body
-                if isinstance(n, ast.FunctionDef)
-            ]
-            classes.append({
-                "name": node.name,
-                "line": node.lineno,
-                "methods": methods,
-                "base_classes": [
-                    getattr(base, "id", str(base))
-                    for base in node.bases
-                ]
-            })
-
-        elif isinstance(node, ast.Import):                           # Logic for imports
-            for alias in node.names:
-                imports.append({
-                    "module": alias.name,
-                    "alias": alias.asname
-                })
-
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                imports.append({
-                    "module": f"{node.module}.{alias.name}",
-                    "alias": alias.asname
-                })
-
-    logger.debug("Functions: %s", functions)
-    logger.debug("Classes: %s", classes)
-    logger.debug("Imports: %s", imports)
-
-    return json.dumps({
-        "status": "success",
-        "functions": functions,
-        "classes": classes,
-        "imports": imports,
-        "summary": {
-            "function_count": len(functions),
-            "class_count": len(classes),
-            "import_count": len(imports)
-        }
-    }, indent=2)
+    except Exception as e:
+        logger.error("extract_code_structure failed unexpectedly: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": f"extract_code_structure failed unexpectedly: {str(e)}",
+        }, indent=2)
 
 # --- TOOL 4: Knowledge Search (RAG) ---
 @mcp.tool()
@@ -492,114 +584,137 @@ def knowledge_search(query: str, category: str = "", n_results: int = 3) -> str:
 @mcp.tool()
 def generate_fix_suggestion(code: str, finding_line: int) -> str:
     """
-        Extracts the function source that contains a given finding line.
+    Extracts the function source that contains a given finding line.
 
-        Pipeline: called by the Optimizer Agent once per finding, before generating
-        a fix. Returns the narrowest possible context so the Optimizer works on
-        real code, not just the flagged line.
+    Pipeline: called by the Optimizer Agent once per finding, before generating
+    a fix. Returns the narrowest possible context so the Optimizer works on
+    real code, not just the flagged line.
 
-        The tool never crashes the pipeline. When full context cannot be extracted
-        (syntax error, line outside any function) it falls back to surrounding lines
-        and sets status="fallback" so the Evaluator can flag limited-context fixes.
+    The tool never crashes the pipeline. When full context cannot be extracted
+    (syntax error, line outside any function) it falls back to surrounding lines
+    and sets status="fallback" so the Evaluator can flag limited-context fixes.
 
-        Args:
-            code:           Python source code — either a full file or a raw snippet.
-            finding_line:   1-based line number from the finding.
+    Args:
+        code:           Python source code — either a full file or a raw snippet.
+        finding_line:   1-based line number from the finding.
 
-        Returns:
-            JSON string with fields:
-            - status:           "success" | "fallback" | "error"
-            - function_name:    Name of the enclosing function, or null on fallback.
-            - function_source:  Extracted source lines as a single string.
-            - start_line:       1-based index of the first returned line.
-            - end_line:         1-based index of the last returned line.
-            - context_type:     "function" | "surrounding_lines"
-            - fallback_reason:  Present only when status="fallback".
+    Returns:
+        JSON string with fields:
+        - status:           "success" | "fallback" | "error"
+        - function_name:    Name of the enclosing function, or null on fallback.
+        - function_source:  Extracted source lines as a single string.
+        - start_line:       1-based index of the first returned line.
+        - end_line:         1-based index of the last returned line.
+        - context_type:     "function" | "surrounding_lines"
+        - fallback_reason:  Present only when status="fallback".
     """
+    # Both args are model-supplied: finding_line drives range math and code feeds
+    # splitlines()/ast.parse — a wrong type would raise before the guards below run.
+    if not isinstance(code, str):
+        logger.error("generate_fix_suggestion: code must be a str, got %s", type(code).__name__)
+        return json.dumps({
+            "status": "error",
+            "message": f"generate_fix_suggestion failed — code must be a string, got {type(code).__name__}",
+        }, indent=2)
+
+    if not isinstance(finding_line, int) or isinstance(finding_line, bool):
+        logger.error("generate_fix_suggestion: finding_line must be an int, got %s", type(finding_line).__name__)
+        return json.dumps({
+            "status": "error",
+            "message": f"generate_fix_suggestion failed — finding_line must be an integer, got {type(finding_line).__name__}",
+        }, indent=2)
 
     logger.info("generate_fix_suggestion called | finding_line=%d", finding_line)
 
-    # --- Guard: empty code ---
-    if not code or not code.strip():
-        logger.warning("generate_fix_suggestion: empty code received")
-        return json.dumps({
-            "status": "error",
-            "message": "code must not be empty.",
-        }, indent=2)
+    try:
+        # --- Guard: empty code ---
+        if not code.strip():
+            logger.warning("generate_fix_suggestion: empty code received")
+            return json.dumps({
+                "status": "error",
+                "message": "code must not be empty.",
+            }, indent=2)
 
-    lines = code.splitlines()
-    total_lines = len(lines)
+        lines = code.splitlines()
+        total_lines = len(lines)
 
-    # --- Guard: line out of range ---
-    if finding_line < 1 or finding_line > total_lines:
-        logger.warning(
-            "generate_fix_suggestion: finding_line=%d out of range (1–%d)",
-            finding_line, total_lines,
-        )
-        return json.dumps({
-            "status": "error",
-            "message": (
-                f"finding_line {finding_line} is out of range "
-                f"(file has {total_lines} lines)."
-            ),
-        }, indent=2)
+        # --- Guard: line out of range ---
+        if finding_line < 1 or finding_line > total_lines:
+            logger.warning(
+                "generate_fix_suggestion: finding_line=%d out of range (1–%d)",
+                finding_line, total_lines,
+            )
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"finding_line {finding_line} is out of range "
+                    f"(file has {total_lines} lines)."
+                ),
+            }, indent=2)
 
-    # --- Helper: surrounding-lines fallback ---
-    # Defined here so it closes over `lines`, `total_lines`, and `finding_line`
-    def _surrounding_lines(reason: str) -> str:
-        n = 5
-        start = max(1, finding_line - n)
-        end = min(total_lines, finding_line + n)
+        # --- Helper: surrounding-lines fallback ---
+        # Defined here so it closes over `lines`, `total_lines`, and `finding_line`
+        def _surrounding_lines(reason: str) -> str:
+            n = 5
+            start = max(1, finding_line - n)
+            end = min(total_lines, finding_line + n)
+            snippet = "\n".join(lines[start - 1: end])
+            logger.info(
+                "generate_fix_suggestion fallback: %s | lines %d–%d", reason, start, end
+            )
+            return json.dumps({
+                "status": "fallback",
+                "fallback_reason": reason,
+                "function_name": None,
+                "function_source": snippet,
+                "start_line": start,
+                "end_line": end,
+                "context_type": "surrounding_lines",
+            }, indent=2)
+
+        # --- Happy path: AST parse ---
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            # Code has a syntax error — surrounding lines is the best we can do
+            return _surrounding_lines(f"SyntaxError at line {e.lineno}: {e.msg}")
+
+        # Walk all FunctionDef nodes and keep those whose line range spans finding_line
+        candidates = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.lineno <= finding_line <= node.end_lineno:
+                    candidates.append(node)
+
+        if not candidates:
+            return _surrounding_lines("finding_line is not inside any function")
+
+        # Innermost function = smallest line range (nested functions have smaller spans)
+        innermost = min(candidates, key=lambda n: n.end_lineno - n.lineno)
+
+        start = innermost.lineno
+        end = innermost.end_lineno
         snippet = "\n".join(lines[start - 1: end])
+
         logger.info(
-            "generate_fix_suggestion fallback: %s | lines %d–%d", reason, start, end
+            "generate_fix_suggestion: function '%s' lines %d–%d",
+            innermost.name, start, end,
         )
         return json.dumps({
-            "status": "fallback",
-            "fallback_reason": reason,
-            "function_name": None,
+            "status": "success",
+            "function_name": innermost.name,
             "function_source": snippet,
             "start_line": start,
             "end_line": end,
-            "context_type": "surrounding_lines",
+            "context_type": "function",
         }, indent=2)
 
-    # --- Happy path: AST parse ---
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        # Code has a syntax error — surrounding lines is the best we can do
-        return _surrounding_lines(f"SyntaxError at line {e.lineno}: {e.msg}")
-
-    # Walk all FunctionDef nodes and keep those whose line range spans finding_line
-    candidates = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.lineno <= finding_line <= node.end_lineno:
-                candidates.append(node)
-
-    if not candidates:
-        return _surrounding_lines("finding_line is not inside any function")
-
-    # Innermost function = smallest line range (nested functions have smaller spans)
-    innermost = min(candidates, key=lambda n: n.end_lineno - n.lineno)
-
-    start = innermost.lineno
-    end = innermost.end_lineno
-    snippet = "\n".join(lines[start - 1: end])
-
-    logger.info(
-        "generate_fix_suggestion: function '%s' lines %d–%d",
-        innermost.name, start, end,
-    )
-    return json.dumps({
-        "status": "success",
-        "function_name": innermost.name,
-        "function_source": snippet,
-        "start_line": start,
-        "end_line": end,
-        "context_type": "function",
-    }, indent=2)
+    except Exception as e:
+        logger.error("generate_fix_suggestion failed unexpectedly: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": f"generate_fix_suggestion failed unexpectedly: {str(e)}",
+        }, indent=2)
 
 # --- TOOL 5: Create Review Report ---
 @mcp.tool()
