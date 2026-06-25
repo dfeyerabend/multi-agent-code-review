@@ -1,9 +1,16 @@
 """
 Local tools for the Enricher Agent.
-submit_enrichment enforces the output schema so the Optimizer always receives consistent findings.
+submit_enrichment collects ONLY the Enricher's own judgment per finding
+(rationale, best_practice_refs, optional severity override), keyed by index.
+All pass-through fields (rule, line, lines, occurrences, category, message,
+doc_url, cwe_id) are carried forward in Python by agents/enricher_agent.py
+from the original findings — never retyped by the LLM.
 """
 
 import json
+
+import logging
+logger = logging.getLogger(__name__)
 
 # === SCHEMA FRAGMENTS ===
 
@@ -16,20 +23,16 @@ _best_practice_ref_schema = {           # one RAG chunk cited as evidence
     },
 }
 
-_enriched_finding_schema = {                        # one fully enriched finding
+_enrichment_entry_schema = {                            # the model's judgment for ONE finding, referenced by index
     "type": "object",
     "properties": {
-        "rule":     {"type": "string"},             # original ruff/bandit rule code, e.g. "B301"
-        "line":     {"type": "integer"},            # line number from the Analyzer
-        "category": {"type": "string"},             # "Style" | "Logic" | "Maintainability" | "Security"
-        "severity": {"type": "string"},             # may override the linter's original severity
-        "rationale": {"type": "string"},            # explanation grounded in RAG context
+        "index": {"type": "integer"},                   # position of the finding within findings_batch
+        "rationale": {"type": "string"},                # explanation grounded in RAG context or doc_url
         "best_practice_refs": {
             "type": "array",
-            "items": _best_practice_ref_schema,     # empty list when RAG had no good match
+            "items": _best_practice_ref_schema,          # empty list when RAG had no good match
         },
-        "doc_url": {"type": ["string", "null"]},    # passed through from Analyzer output -> ruff's url field / bandit's more_info field -> can be used when no good match is found in database
-        "cwe_id":  {"type": ["integer", "null"]},   # bandit findings only, null otherwise -> bandit's issue_cwe.id field
+        "severity": {"type": "string"},                  # OPTIONAL override; omit to keep the original severity
     },
 }
 
@@ -39,9 +42,11 @@ enricher_local_tools = [
     {
         "name": "submit_enrichment",
         "description": (
-            "Submit the final reviewed findings after classifying every issue "
-            "from the Analyzer's output. Call knowledge_search for each finding "
-            "before submitting. You MUST call this tool as your final step. "
+            "Submit your enrichment judgment for every finding in the batch. "
+            "Call knowledge_search for each finding before submitting. Reference "
+            "each finding by its 'index' field — do NOT repeat rule, line, "
+            "category, message, doc_url, or cwe_id; those are carried forward "
+            "automatically. You MUST call this tool as your final step. "
             "Do NOT respond with plain text — always submit through this tool."
         ),
         "input_schema": {
@@ -50,10 +55,10 @@ enricher_local_tools = [
                 "findings": {
                     "type": "array",
                     "description": (
-                        "One entry per finding from the Analyzer. "
-                        "Empty list if the Analyzer reported no issues."
+                        "One enrichment entry per finding in findings_batch, "
+                        "referenced by index. Empty list if the batch was empty."
                     ),
-                    "items": _enriched_finding_schema,
+                    "items": _enrichment_entry_schema,
                 },
                 "summary": {
                     "type": "string",
@@ -73,101 +78,113 @@ enricher_local_tools = [
 
 def run_enricher_tool(name: str, tool_input: dict) -> str:
     """
-    Executes local reviewer tools by name.
+    Executes local enricher tools by name.
+
+    Pipeline: called by the agentic loop in agents/enricher_agent.py whenever
+    the model invokes a tool name in LOCAL_TOOL_NAMES. The validated enrichment
+    list returned here is later merged with the original findings_batch by
+    _merge_enrichment in agents/enricher_agent.py.
 
     Args:
         name:       Name of the tool to execute.
-        tool_input: Dict of arguments passed by the agents.
+        tool_input: Dict of arguments passed by the model.
 
     Returns:
-        JSON string with status and validated review data, or an error message.
+        JSON string with status and the validated enrichment list, or a
+        structured error message pinpointing the failing entry/field.
     """
-    if name == "submit_enrichment":
-        try:
-            required_fields = ["findings", "summary", "rag_used"]
-            missing = [f for f in required_fields if f not in tool_input]   # checks for all required fields in tool_input
-            if missing:
-                return json.dumps({
-                    "status": "error",
-                    "message": f"Missing required fields: {missing}",
-                })
+    if not isinstance(name, str):                                    # fail loud on a malformed call site, not a malformed model output
+        return json.dumps({
+            "status": "error",
+            "message": f"run_enricher_tool: 'name' must be a string, got {type(name).__name__}.",
+        })
+    if not isinstance(tool_input, dict):
+        return json.dumps({
+            "status": "error",
+            "message": f"run_enricher_tool: 'tool_input' must be a dict, got {type(tool_input).__name__}.",
+        })
 
-            if not isinstance(tool_input["findings"], list):                # guard against the agents passing a dict instead of a list
-                return json.dumps({
-                    "status": "error",
-                    "message": "'findings' must be a list.",
-                })
+    if name != "submit_enrichment":
+        logger.warning("run_enricher_tool: unknown tool requested: %s", name)
+        return json.dumps({"status": "error", "message": f"Unknown enricher tool: {name}"})
 
-            if not isinstance(tool_input["summary"], str):
-                return json.dumps({
-                    "status": "error",
-                    "message": "'summary' must be a string.",
-                })
-
-            if not isinstance(tool_input["rag_used"], bool):
-                return json.dumps({
-                    "status": "error",
-                    "message": "'rag_used' must be a boolean.",
-                })
-
-            # Verifies that the output contains the correct formats
-            finding_errors = []
-            for i, finding in enumerate(tool_input["findings"]):
-                if not isinstance(finding, dict):
-                    finding_errors.append(f"findings[{i}]: must be an object, got {type(finding).__name__}")
-                    continue
-                if not isinstance(finding.get("rule"), str):
-                    finding_errors.append(f"findings[{i}]: 'rule' must be a string")
-                if not isinstance(finding.get("line"), int):
-                    finding_errors.append(f"findings[{i}]: 'line' must be an integer")
-                if not isinstance(finding.get("category"), str):
-                    finding_errors.append(f"findings[{i}]: 'category' must be a string")
-                if not isinstance(finding.get("severity"), str):
-                    finding_errors.append(f"findings[{i}]: 'severity' must be a string")
-                if not isinstance(finding.get("rationale"), str):
-                    finding_errors.append(f"findings[{i}]: 'rationale' must be a string")
-                if not isinstance(finding.get("best_practice_refs"), list):
-                    finding_errors.append(f"findings[{i}]: 'best_practice_refs' must be a list")
-                else:
-                    for j, ref in enumerate(finding["best_practice_refs"]):
-                        if not isinstance(ref, dict):
-                            finding_errors.append(
-                                f"findings[{i}].best_practice_refs[{j}]: must be an object, got {type(ref).__name__}")
-                            continue
-                        if not isinstance(ref.get("source"), str):
-                            finding_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'source' must be a string")
-                        if not isinstance(ref.get("section"), str):
-                            finding_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'section' must be a string")
-                        if not isinstance(ref.get("text"), str):
-                            finding_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'text' must be a string")
-                doc_url = finding.get("doc_url")
-                if doc_url is not None and not isinstance(doc_url, str):
-                    finding_errors.append(f"findings[{i}]: 'doc_url' must be a string or null")
-                cwe_id = finding.get("cwe_id")
-                if cwe_id is not None and not isinstance(cwe_id, int):
-                    finding_errors.append(f"findings[{i}]: 'cwe_id' must be an integer or null")
-
-            if finding_errors:
-                return json.dumps({
-                    "status": "error",
-                    "message": "Finding entries failed validation. Correct and resubmit.",
-                    "errors": finding_errors,
-                })
-
-            return json.dumps({
-                "status": "success",
-                "enrichment_results": tool_input,
-                "metadata": {
-                    "total_reviewed_findings": len(tool_input["findings"]),
-                    "rag_used": tool_input["rag_used"],
-                },
-            }, indent=2)
-
-        except Exception as e:
+    try:
+        required_fields = ["findings", "summary", "rag_used"]
+        missing = [f for f in required_fields if f not in tool_input]
+        if missing:
             return json.dumps({
                 "status": "error",
-                "message": f"submit_enrichment failed: {str(e)}",
+                "message": f"submit_enrichment: missing required fields: {missing}",
             })
 
-    else:
-        return json.dumps({"error": f"Unknown reviewer tool: {name}"})
+        if not isinstance(tool_input["findings"], list):
+            return json.dumps({
+                "status": "error",
+                "message": f"submit_enrichment: 'findings' must be a list, got {type(tool_input['findings']).__name__}.",
+            })
+        if not isinstance(tool_input["summary"], str):
+            return json.dumps({
+                "status": "error",
+                "message": f"submit_enrichment: 'summary' must be a string, got {type(tool_input['summary']).__name__}.",
+            })
+        if not isinstance(tool_input["rag_used"], bool):
+            return json.dumps({
+                "status": "error",
+                "message": f"submit_enrichment: 'rag_used' must be a boolean, got {type(tool_input['rag_used']).__name__}.",
+            })
+
+        # Validate each enrichment entry independently so one malformed item
+        # produces a precise, targeted correction instead of a blanket failure.
+        entry_errors = []
+        for i, entry in enumerate(tool_input["findings"]):
+            if not isinstance(entry, dict):
+                entry_errors.append(f"findings[{i}]: must be an object, got {type(entry).__name__}")
+                continue
+
+            if not isinstance(entry.get("index"), int):
+                entry_errors.append(f"findings[{i}]: 'index' must be an integer")
+            if not isinstance(entry.get("rationale"), str):
+                entry_errors.append(f"findings[{i}]: 'rationale' must be a string")
+
+            refs = entry.get("best_practice_refs")
+            if not isinstance(refs, list):
+                entry_errors.append(f"findings[{i}]: 'best_practice_refs' must be a list")
+            else:
+                for j, ref in enumerate(refs):
+                    if not isinstance(ref, dict):
+                        entry_errors.append(
+                            f"findings[{i}].best_practice_refs[{j}]: must be an object, got {type(ref).__name__}")
+                        continue
+                    if not isinstance(ref.get("source"), str):
+                        entry_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'source' must be a string")
+                    if not isinstance(ref.get("section"), str):
+                        entry_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'section' must be a string")
+                    if not isinstance(ref.get("text"), str):
+                        entry_errors.append(f"findings[{i}].best_practice_refs[{j}]: 'text' must be a string")
+
+            if "severity" in entry and not isinstance(entry["severity"], str):  # severity is optional, but if present it must be valid
+                entry_errors.append(f"findings[{i}]: 'severity' must be a string when present")
+
+        if entry_errors:
+            return json.dumps({
+                "status": "error",
+                "message": "Enrichment entries failed validation. Correct and resubmit.",
+                "errors": entry_errors,
+            })
+
+        return json.dumps({
+            "status": "success",
+            "enrichments": tool_input["findings"],
+            "summary": tool_input["summary"],
+            "rag_used": tool_input["rag_used"],
+            "metadata": {
+                "total_enriched": len(tool_input["findings"]),
+            },
+        }, indent=2)
+
+    except Exception as e:
+        logger.error("run_enricher_tool: submit_enrichment failed unexpectedly: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": f"submit_enrichment failed unexpectedly: {str(e)}",
+        })

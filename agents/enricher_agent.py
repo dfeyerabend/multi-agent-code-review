@@ -33,6 +33,80 @@ LOCAL_TOOL_NAMES = {t["name"] for t in enricher_local_tools}
 
 # === HELPER FUNCTIONS ===
 
+def _merge_enrichment(findings_batch: list, enrichments: list) -> list:
+    """
+    Merges the model's per-finding judgment into copies of the original findings.
+
+    Pipeline: called by _run_enricher_batch after submit_enrichment succeeds for
+    a batch. This is the Python-side counterpart to the LLM's enrichment_results —
+    it carries forward every pass-through field (rule, line, lines, occurrences,
+    category, message, doc_url, cwe_id) from findings_batch verbatim, so the model
+    never has to retype them.
+
+    Args:
+        findings_batch: The original findings for this batch, each carrying an
+                         'index' field assigned by _run_enricher_batch.
+        enrichments:    Validated enrichment entries from submit_enrichment, each
+                         with 'index', 'rationale', 'best_practice_refs', and an
+                         optional 'severity' override.
+
+    Returns:
+        List of enriched findings, one per entry in findings_batch, in the same
+        order. A finding with no matching enrichment is kept with a placeholder
+        rationale rather than dropped. Returns an empty list on unexpected failure.
+    """
+    if not isinstance(findings_batch, list):
+        logger.error("_merge_enrichment: findings_batch must be a list, got %s", type(findings_batch).__name__)
+        return []
+    if not isinstance(enrichments, list):
+        logger.error("_merge_enrichment: enrichments must be a list, got %s", type(enrichments).__name__)
+        return []
+
+    try:
+        by_index = {}
+        for entry in enrichments:
+            if not isinstance(entry, dict) or not isinstance(entry.get("index"), int):
+                logger.warning("_merge_enrichment: skipping malformed enrichment entry: %r", entry)
+                continue
+            by_index[entry["index"]] = entry
+
+        merged = []
+        for finding in findings_batch:
+            if not isinstance(finding, dict):  # one malformed entry must not abort the batch
+                logger.warning("_merge_enrichment: skipping non-dict finding: %r", finding)
+                continue
+
+            idx = finding.get("index")
+            enrichment = by_index.get(idx)
+
+            enriched = dict(finding)            # copy — never mutate the caller's original finding
+            enriched.pop("index", None)         # batch-local bookkeeping field, not part of the output contract
+
+            if enrichment is None:
+                # A finding the model never addressed must still surface downstream,
+                # just flagged clearly rather than silently dropped.
+                logger.warning(
+                    "_merge_enrichment: no enrichment for finding index=%s rule=%s line=%s",
+                    idx, finding.get("rule"), finding.get("line"),
+                )
+                enriched["rationale"] = "Enrichment missing — model did not address this finding."
+                enriched["best_practice_refs"] = []
+                merged.append(enriched)
+                continue
+
+            enriched["rationale"] = enrichment["rationale"]
+            enriched["best_practice_refs"] = enrichment["best_practice_refs"]
+            if "severity" in enrichment:          # optional override — only replace when the model actually upgraded it
+                enriched["severity"] = enrichment["severity"]
+
+            merged.append(enriched)
+
+        return merged
+
+    except Exception as e:
+        logger.error("_merge_enrichment failed unexpectedly: %s", str(e))
+        return []
+
 def _extract_final_output(messages: list, final_response) -> dict:
     """
     Extracts the submit_enrichment result from the conversation history.
@@ -45,7 +119,8 @@ def _extract_final_output(messages: list, final_response) -> dict:
         final_response: Last Anthropic API response object (fallback source only).
 
     Returns:
-        dict containing the validated enrichment output, or error info.
+        dict containing the validated 'enrichments' list, 'summary', and
+        'rag_used', or error info.
     """
     if not isinstance(messages, list):
         logger.error(
@@ -61,7 +136,7 @@ def _extract_final_output(messages: list, final_response) -> dict:
                     if block.get("type") == "tool_result":
                         try:
                             result = json.loads(block["content"])
-                            if result.get("status") == "success" and "enrichment_results" in result:
+                            if result.get("status") == "success" and "enrichments" in result:
                                 return result
                         except (json.JSONDecodeError, TypeError):
                             continue
@@ -82,7 +157,6 @@ def _extract_final_output(messages: list, final_response) -> dict:
         logger.error("_extract_final_output failed unexpectedly: %s", str(e))
         return {"status": "error", "message": f"Unexpected error extracting output: {str(e)}"}
 
-
 # === AGENT LOOP ===
 
 async def _run_enricher_batch(findings_batch: list, session: ClientSession, all_tools: list) -> dict:
@@ -99,7 +173,8 @@ async def _run_enricher_batch(findings_batch: list, session: ClientSession, all_
         all_tools:      Combined MCP + local tool list, built once by run_enricher.
 
     Returns:
-        dict with enriched findings for this batch, or error info.
+        dict with merged enriched findings for this batch ('enrichment_results'),
+        or error info.
     """
     if not isinstance(findings_batch, list):
         logger.error(
@@ -120,7 +195,10 @@ async def _run_enricher_batch(findings_batch: list, session: ClientSession, all_
         return {"status": "error", "message": "Invalid input: session is None"}
 
     try:
-        messages = [{"role": "user", "content": json.dumps(findings_batch, indent=2)}]
+        # Tag each finding with its batch-local position so the model can reference it
+        # by index instead of retyping the finding's own fields back into the tool call.
+        indexed_batch = [{**finding, "index": i} for i, finding in enumerate(findings_batch)]
+        messages = [{"role": "user", "content": json.dumps(indexed_batch, indent=2)}]
 
         for iteration in range(MAX_ITERATIONS):
             logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
@@ -137,8 +215,24 @@ async def _run_enricher_batch(findings_batch: list, session: ClientSession, all_
 
             if response.stop_reason == "end_turn":
                 final_output = _extract_final_output(messages, response)
+
+                if final_output.get("status") != "success":
+                    logger.warning(
+                        "Batch ended turn without a valid submit_enrichment result: %s",
+                        final_output.get("message"),
+                    )
+                    return final_output
+
+                merged_findings = _merge_enrichment(indexed_batch, final_output["enrichments"])
                 logger.info("Batch completed after %d iteration(s)", iteration + 1)
-                return final_output
+                return {
+                    "status": "success",
+                    "enrichment_results": {
+                        "findings": merged_findings,
+                        "summary": final_output["summary"],
+                        "rag_used": final_output["rag_used"],
+                    },
+                }
 
             elif response.stop_reason == "tool_use":
                 messages.append({"role": "assistant", "content": response.content})
@@ -294,10 +388,12 @@ if __name__ == "__main__":
     setup_logging()
 
     test_findings = [
-        {"rule": "F401", "message": "`os` imported but unused", "line": 1, "severity": "HIGH", "category": "Logic",
+        {"rule": "F401", "message": "`os` imported but unused", "line": 1, "lines": [1], "occurrences": 1,
+         "severity": "LOW", "category": "Logic",
          "doc_url": "https://docs.astral.sh/ruff/rules/unused-import"},
         {"rule": "B608", "message": "Possible SQL injection via string-based query construction", "line": 3,
-         "severity": "HIGH", "category": "Security",
+         "lines": [3, 17], "occurrences": 2,
+         "severity": "MEDIUM", "category": "Security",
          "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",
          "cwe_id": 89},
     ]

@@ -70,6 +70,13 @@ ENRICHER_PROMPT = (
     "- `submit_enrichment`: Local tool. Call this once as your final step.\n"
     "\n"
 
+    "## Input Format\n"
+    "Each finding you receive has an `index` field — its position in this batch. "
+    "Reference the finding by its `index` in your submission. Do NOT repeat `rule`, "
+    "`line`, `category`, `message`, `doc_url`, or `cwe_id` — these are carried over "
+    "automatically and are not part of your output.\n"
+    "\n"
+
     "## Workflow\n"
     "For each finding in the Analyzer's output:\n"
     "1. Call `knowledge_search` with query='{rule} {message}' and category='{category}'.\n"
@@ -78,9 +85,11 @@ ENRICHER_PROMPT = (
     "and write a `rationale` grounded in their content.\n"
     "   - If all chunks have distance > 1.1: set `best_practice_refs` to [] and note in "
     "`rationale` that no matching best practice was found — reference `doc_url` instead.\n"
-    "3. You may upgrade `severity` if the RAG context reveals the issue is more critical "
-    "than the linter reported. Keep the original severity otherwise.\n"
-    "After processing all findings, call `submit_enrichment` with the enriched list.\n"
+    "3. You may include a `severity` override if the RAG context reveals the issue is more "
+    "critical than the linter reported. Omit `severity` otherwise — the original severity "
+    "is kept automatically.\n"
+    "After processing all findings, call `submit_enrichment` with one enrichment entry per "
+    "finding: `index`, `rationale`, `best_practice_refs`, and `severity` only if overriding.\n"
     "\n"
 
     "## Rules\n"

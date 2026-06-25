@@ -15,7 +15,7 @@ from agents.optimizer_agent import run_optimizer
 from agents.evaluator_agent import run_evaluator
 
 # Fields the Enricher needs from each finding — everything else stays in the orchestrator.
-_ENRICHER_FIELDS = {"rule", "line", "category", "severity", "message", "doc_url", "cwe_id"}
+_ENRICHER_FIELDS = {"rule", "line", "lines", "occurrences", "category", "severity", "message", "doc_url", "cwe_id"}
 
 
 async def run_pipeline(code_input: str) -> dict:
