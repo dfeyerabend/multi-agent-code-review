@@ -206,6 +206,10 @@ async def run_analyzer(code_input: str) -> dict:
             },
         }
 
+    # Scanners receive the exact code captured from read_code, never the model's retyped
+    # copy — a retyped string can be silently corrupted and make ruff/bandit scan the wrong code.
+    _CODE_ARG_TOOLS = {"detect_syntax_errors", "extract_code_structure"}
+
     try:
         server_params = StdioServerParameters(command="python", args=[MCP_SERVER_PATH])
 
@@ -227,6 +231,7 @@ async def run_analyzer(code_input: str) -> dict:
 
                 messages = [{"role": "user", "content": code_input}]
                 mcp_outputs = {}  # captured verbatim per tool name, used by _assemble_analysis after the loop ends
+                captured_code = None  # the authoritative code string from read_code, forced into later scanner calls
 
                 for iteration in range(MAX_ITERATIONS):
                     logger.debug("Iteration %d/%d", iteration + 1, MAX_ITERATIONS)
@@ -265,14 +270,30 @@ async def run_analyzer(code_input: str) -> dict:
                             if block.type == "tool_use":
                                 logger.debug("Tool call: %s | args: %s", block.name, str(block.input)[:200])
 
+                                # Force the real code into scanner calls; the model's retyped copy is discarded.
+                                tool_input = block.input
+                                if block.name in _CODE_ARG_TOOLS:
+                                    if captured_code is not None:
+                                        tool_input = {**block.input, "code": captured_code}
+                                    else:  # scanner requested before read_code ran — predictable agent ordering failure
+                                        logger.warning(
+                                            "run_analyzer: %s called before read_code — using model-provided code as fallback",
+                                            block.name,
+                                        )
+
                                 if block.name in LOCAL_TOOL_NAMES:
-                                    tool_output = run_analyzer_tool(block.name, block.input)
+                                    tool_output = run_analyzer_tool(block.name, tool_input)
                                 else:
                                     try:
-                                        result = await session.call_tool(block.name, arguments=block.input)
+                                        result = await session.call_tool(block.name, arguments=tool_input)
                                         tool_output = result.content[0].text if result.content else ""
                                         try:
                                             mcp_outputs[block.name] = json.loads(tool_output)  # captured for Python-side assembly, not for the LLM to retype
+                                            # Capture the authoritative code the moment read_code succeeds.
+                                            if block.name == "read_code":
+                                                code_val = mcp_outputs[block.name].get("code")
+                                                if isinstance(code_val, str):
+                                                    captured_code = code_val
                                         except json.JSONDecodeError:
                                             logger.warning("Could not parse MCP output for %s as JSON", block.name)
                                     except Exception as e:
