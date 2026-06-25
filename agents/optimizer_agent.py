@@ -125,7 +125,7 @@ def _extract_final_output(messages: list, final_response) -> dict:
                     if block.get("type") == "tool_result":
                         try:
                             result = json.loads(block["content"])
-                            if result.get("status") == "success" and "optimization_results" in result:
+                            if result.get("status") == "success" and "fixes" in result:  # tool now returns fixes/summary flat, not nested
                                 return result
                         except (json.JSONDecodeError, TypeError):
                             continue
@@ -147,6 +147,118 @@ def _extract_final_output(messages: list, final_response) -> dict:
         return {"status": "error", "message": f"Unexpected error extracting output: {str(e)}"}
 
 
+def _merge_fixes(findings_batch: list, fixes: list) -> list:
+    """
+    Reattaches finding identity (finding_rule, finding_line, lines, category) from the
+    original findings onto the model's index-keyed fix output.
+
+    Pipeline: called by _run_optimizer_batch after a successful submit_optimization
+    result, before the batch's fixes are returned to run_optimizer.
+
+    Identity fields must never come from the model — see the de-laundering rule in
+    CLAUDE.md. findings_batch entries carry an 'index' field (attached by
+    _run_optimizer_batch before the LLM call) that fixes reference to say which
+    finding they address.
+
+    Args:
+        findings_batch: Findings sent to the model for this batch, each with an
+                         'index' field already attached.
+        fixes:          Validated fix list from submit_optimization, each item
+                         carrying 'index', 'suggested_code', 'explanation', 'grounded_in'.
+
+    Returns:
+        List of merged fix dicts, one per finding in findings_batch, in the same
+        finding_rule/finding_line/suggested_code/explanation/grounded_in shape the
+        Evaluator already expects, plus carried-through lines/category. A finding
+        with no matching fix gets a null-suggested_code entry instead of being dropped.
+    """
+    if not isinstance(findings_batch, list):
+        logger.error("_merge_fixes: findings_batch must be a list, got %s", type(findings_batch).__name__)
+        return []
+
+    if not isinstance(fixes, list):
+        logger.error("_merge_fixes: fixes must be a list, got %s", type(fixes).__name__)
+        fixes = []  # treat as no fixes — every finding still needs an entry, see fallback below
+
+    try:
+        # Index the model's fixes once so each finding can look itself up by position,
+        # not by retyped identity — that lookup IS the de-laundering boundary.
+        fixes_by_index = {}
+        for i, fix in enumerate(fixes):
+            if not isinstance(fix, dict):
+                logger.warning("_merge_fixes: skipping fixes[%d] — not a dict (%s)", i, type(fix).__name__)
+                continue
+            idx = fix.get("index")
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                logger.warning("_merge_fixes: skipping fixes[%d] — invalid index %r", i, idx)
+                continue
+            fixes_by_index[idx] = fix
+
+        merged = []
+        for finding in findings_batch:
+            try:
+                idx = finding.get("index")
+                fix = fixes_by_index.get(idx)
+
+                if fix is None:  # model never addressed this finding — must not silently vanish from the report
+                    logger.warning(
+                        "_merge_fixes: no fix for finding index %s (rule %s line %s) — emitting null fix",
+                        idx, finding.get("rule"), finding.get("line"),
+                    )
+                    merged.append({
+                        "finding_rule": finding.get("rule"),
+                        "finding_line": finding.get("line"),
+                        "lines": finding.get("lines"),
+                        "category": finding.get("category"),
+                        "suggested_code": None,
+                        "explanation": "Optimizer did not return a fix for this finding.",
+                        "grounded_in": [],
+                    })
+                    continue
+
+                merged.append({
+                    "finding_rule": finding.get("rule"),
+                    "finding_line": finding.get("line"),
+                    "lines": finding.get("lines"),
+                    "category": finding.get("category"),
+                    "suggested_code": fix.get("suggested_code"),
+                    "explanation": fix.get("explanation", ""),
+                    "grounded_in": fix.get("grounded_in", []),
+                })
+
+            except Exception as e:
+                # one malformed finding must not drop the rest of the batch from the report
+                logger.error("_merge_fixes: failed to merge finding %r: %s", finding, str(e))
+                merged.append({
+                    "finding_rule": finding.get("rule") if isinstance(finding, dict) else None,
+                    "finding_line": finding.get("line") if isinstance(finding, dict) else None,
+                    "lines": finding.get("lines") if isinstance(finding, dict) else None,
+                    "category": finding.get("category") if isinstance(finding, dict) else None,
+                    "suggested_code": None,
+                    "explanation": f"Optimizer merge failed for this finding: {str(e)}",
+                    "grounded_in": [],
+                })
+
+        return merged
+
+    except Exception as e:
+        logger.error("_merge_fixes failed unexpectedly: %s", str(e))
+        # last-resort fallback: still emit one null-fix entry per finding rather than dropping the batch
+        return [
+            {
+                "finding_rule": f.get("rule") if isinstance(f, dict) else None,
+                "finding_line": f.get("line") if isinstance(f, dict) else None,
+                "lines": f.get("lines") if isinstance(f, dict) else None,
+                "category": f.get("category") if isinstance(f, dict) else None,
+                "suggested_code": None,
+                "explanation": f"Optimizer merge failed unexpectedly: {str(e)}",
+                "grounded_in": [],
+            }
+            for f in findings_batch if isinstance(f, dict)
+        ]
+
+# === AGENT LOOP ===
+
 async def _run_optimizer_batch(
     code: str,
     findings_batch: list,
@@ -159,6 +271,12 @@ async def _run_optimizer_batch(
     Pipeline: called by run_optimizer_single (one finding) and
     run_optimizer_group (one rule-code chunk). Each call is fully
     independent — no shared state between batches.
+
+    Each finding gets a batch-local 'index' attached before being sent to the
+    model, so the model can reference findings without retyping their identity.
+    After a successful submit_optimization call, _merge_fixes reattaches
+    finding_rule/finding_line/lines/category from the original findings —
+    those fields are never trusted from the model's output.
 
     Args:
         code:           Full source code string, passed once per batch.
@@ -188,9 +306,16 @@ async def _run_optimizer_batch(
         return {"status": "error", "message": f"Invalid input: all_tools must be list, got {type(all_tools).__name__}"}
 
     try:
+        # Tag each finding with its batch-local position so the model can reference
+        # it by index instead of retyping finding_rule/finding_line into its output.
+        indexed_batch = [
+            {**finding, "index": i} if isinstance(finding, dict) else finding
+            for i, finding in enumerate(findings_batch)
+        ]
+
         batch_input = {
             "code": code,
-            "findings": findings_batch,
+            "findings": indexed_batch,
         }
         messages = [{"role": "user", "content": json.dumps(batch_input, indent=2)}]
 
@@ -210,6 +335,10 @@ async def _run_optimizer_batch(
             if response.stop_reason == "end_turn":
                 final_output = _extract_final_output(messages, response)
                 logger.info("Batch completed after %d iteration(s)", iteration + 1)
+
+                if final_output.get("status") == "success" and isinstance(final_output.get("fixes"), list):
+                    final_output["fixes"] = _merge_fixes(indexed_batch, final_output["fixes"])
+
                 return final_output
 
             elif response.stop_reason == "tool_use":
@@ -261,8 +390,6 @@ async def _run_optimizer_batch(
             "message": f"Unexpected error — likely API or network failure: {str(e)}",
         }
 
-
-# === AGENT LOOP ===
 
 async def run_optimizer_single(
     finding: dict,
@@ -437,6 +564,8 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                         all_fixes.append({
                             "finding_rule": finding.get("rule"),
                             "finding_line": finding.get("line"),
+                            "lines": finding.get("lines"),
+                            "category": finding.get("category"),
                             "suggested_code": None,
                             "explanation": f"Optimizer failed: {result.get('message', 'unknown error')}",
                             "grounded_in": [],
@@ -444,7 +573,7 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                         failed_count += 1
                         continue
 
-                    fixes = result.get("optimization_results", {}).get("fixes")
+                    fixes = result.get("fixes")
                     if not isinstance(fixes, list):     # internal contract violation — silently extending with a non-list would corrupt all_fixes
                         logger.error(
                             "Individual call for rule %s returned malformed fixes — expected list, got %s",
@@ -453,6 +582,8 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                         all_fixes.append({
                             "finding_rule": finding.get("rule"),
                             "finding_line": finding.get("line"),
+                            "lines": finding.get("lines"),
+                            "category": finding.get("category"),
                             "suggested_code": None,
                             "explanation": "Optimizer returned malformed output — no fixes list present.",
                             "grounded_in": [],
@@ -485,6 +616,8 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                                 all_fixes.append({
                                     "finding_rule": finding.get("rule"),
                                     "finding_line": finding.get("line"),
+                                    "lines": finding.get("lines"),
+                                    "category": finding.get("category"),
                                     "suggested_code": None,
                                     "explanation": f"Optimizer failed: {result.get('message', 'unknown error')}",
                                     "grounded_in": [],
@@ -492,7 +625,7 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                             failed_count += len(chunk)
                             continue
 
-                        fixes = result.get("optimization_results", {}).get("fixes")
+                        fixes = result.get("fixes")
                         if not isinstance(fixes, list):     # internal contract violation — silently extending with a non-list would corrupt all_fixes
                             logger.error(
                                 "Style group '%s' chunk %d returned malformed fixes — expected list, got %s",
@@ -502,6 +635,8 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                                 all_fixes.append({
                                     "finding_rule": finding.get("rule"),
                                     "finding_line": finding.get("line"),
+                                    "lines": finding.get("lines"),
+                                    "category": finding.get("category"),
                                     "suggested_code": None,
                                     "explanation": "Optimizer returned malformed output — no fixes list present.",
                                     "grounded_in": [],
@@ -545,24 +680,43 @@ if __name__ == "__main__":
     from config import setup_logging
     setup_logging()
 
+    # Trailing whitespace deliberately placed on lines 2 and 4 so the W291 finding
+    # below carries a real multi-entry `lines` list — exercises the duplicate-line path.
     test_code = (
         "import os, sys\n"
-        "import json\n"
+        "import json   \n"                                          # line 2: trailing whitespace
         "def get_user(id):\n"
-        "    query = 'SELECT * FROM users WHERE id = ' + id\n"
+        "    query = 'SELECT * FROM users WHERE id = ' + id   \n"    # line 4: SQL injection + trailing whitespace
         "    return query\n"
     )
 
+    # Findings mirror real Enricher output: `lines` and `occurrences` are ALWAYS present,
+    # and `line` always equals `lines[0]`. The W291 finding spans two lines to prove the
+    # optimizer addresses every entry in `lines`, not just the first.
     test_findings = [
         {
             "rule": "B608",
             "line": 4,
+            "lines": [4],
+            "occurrences": 1,
             "category": "Security",
             "severity": "HIGH",
             "rationale": "String-based SQL query construction allows injection attacks.",
             "best_practice_refs": [],
             "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",
             "cwe_id": 89,
+        },
+        {
+            "rule": "W291",
+            "line": 2,
+            "lines": [2, 4],
+            "occurrences": 2,
+            "category": "Style",
+            "severity": "LOW",
+            "rationale": "Trailing whitespace should be removed.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/trailing-whitespace",
+            "cwe_id": None,
         },
     ]
 
