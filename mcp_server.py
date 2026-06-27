@@ -726,9 +726,8 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
     before submit_evaluation.
 
     Args:
-        fixes_evaluated: List of evaluated fix dicts, each with finding_rule,
-                         finding_line, status, reasoning, suggested_code,
-                         and grounded_in.
+        fixes_evaluated: List of evaluated fix dicts, each with rule, lines,
+                         status, reasoning, suggested_code, and grounded_in.
         summary:         Overall summary string produced by the Evaluator.
 
     Returns:
@@ -777,8 +776,10 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
                     "message": f"create_review_report failed — fixes_evaluated[{i}] must be a dict, got {type(fix).__name__}",
                 }, indent=2)
 
-            rule           = fix.get("finding_rule", "?")
-            line           = fix.get("finding_line", "?")
+            rule           = fix.get("rule", "?")
+            loc            = fix.get("lines")
+            # `lines` is now a list per finding; render it as a comma-separated location string.
+            loc_display    = ", ".join(str(n) for n in loc) if isinstance(loc, list) and loc else "?"
             status         = fix.get("status", "?")
             reasoning      = fix.get("reasoning", "")
             suggested_code = fix.get("suggested_code", "")
@@ -788,11 +789,11 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
             if grounded_in and not isinstance(grounded_in, list):
                 return json.dumps({
                     "status": "error",
-                    "message": f"create_review_report failed — grounded_in for rule {rule!r} line {line} must be a list, got {type(grounded_in).__name__}",
+                    "message": f"create_review_report failed — grounded_in for rule {rule!r} line {loc_display} must be a list, got {type(grounded_in).__name__}",
                 }, indent=2)
 
             lines += [
-                f"## {emoji} Rule `{rule}` — Line {line}",
+                f"## {emoji} Rule `{rule}` — Line {loc_display}",
                 f"**Status:** {status}",
                 "",
                 f"**Reasoning:** {reasoning}",

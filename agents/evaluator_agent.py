@@ -27,66 +27,6 @@ from tools.evaluator_tools import (
 
 # === HELPER FUNCTIONS ===
 
-def _match_pairs(enriched_findings: list, fixes: list) -> list:
-    """
-    Pairs each finding with its corresponding fix by rule + line.
-
-    Pipeline: called once by run_evaluator before any LLM calls, after input
-    validation passes.
-
-    Args:
-        enriched_findings: List of enriched finding dicts from the Enricher.
-        fixes:             List of fix dicts from the Optimizer.
-
-    Returns:
-        List of dicts with keys 'finding' and 'fix' (fix is None when the
-        Optimizer produced no entry for that finding), or an error dict on
-        unexpected failure.
-    """
-    if not isinstance(enriched_findings, list):
-        logger.error(
-            "_match_pairs: enriched_findings must be a list, got %s",
-            type(enriched_findings).__name__,
-        )
-        return []
-
-    if not isinstance(fixes, list):
-        logger.error(
-            "_match_pairs: fixes must be a list, got %s",
-            type(fixes).__name__,
-        )
-        return []
-
-    try:
-        fix_index = {
-            (f.get("finding_rule"), f.get("finding_line")): f
-            for f in fixes
-            if isinstance(f, dict)      # non-dict entries are silently skipped — a bad fix must not block all matches
-        }
-
-        pairs = []
-        for finding in enriched_findings:
-            if not isinstance(finding, dict):  # a malformed finding cannot be matched or evaluated
-                logger.warning("_match_pairs: skipping non-dict finding: %s", type(finding).__name__)
-                continue
-            key = (finding.get("rule"), finding.get("line"))
-            pairs.append({
-                "finding": finding,
-                "fix": fix_index.get(key),  # None if optimizer produced no fix for this finding
-            })
-
-        logger.info(
-            "_match_pairs: %d finding(s) → %d matched, %d unmatched",
-            len(enriched_findings),
-            sum(1 for p in pairs if p["fix"] is not None),
-            sum(1 for p in pairs if p["fix"] is None),
-        )
-        return pairs
-
-    except Exception as e:
-        logger.error("_match_pairs failed unexpectedly: %s", str(e))
-        return []
-
 def _derive_status(verdicts: dict) -> str:
     """
     Derives a deterministic status string from the three LLM verdicts.
@@ -264,79 +204,204 @@ def _extract_final_output(messages: list, final_response) -> dict:
         return {"status": "error", "message": f"Unexpected error extracting output: {str(e)}"}
 
 
-def _unresolvable_entry(
-    finding_rule: str,
-    finding_line,
+def _evaluated_entry(
+    rule,
+    lines,
     category: str,
-    fix,
-    reason: str,
+    status: str,
+    suggested_code,
+    grounded_in,
+    reasoning: str,
+    faithfulness,
+    correctness,
+    completeness,
 ) -> dict:
     """
-    Builds a standardised UNRESOLVABLE entry without an LLM call.
+    Builds one fixes_evaluated entry with the full report schema.
 
-    Pipeline: called by run_evaluator for null fixes and all validation
-    failures. Centralised here so every UNRESOLVABLE entry has an identical
-    schema — a missing field in any one of them would crash create_review_report.
+    Pipeline: called by _entries_for_fix (this module) for every covered finding key, so
+    every entry create_review_report renders carries an identical set of keys — a missing
+    field in any one of them would break the report.
 
     Args:
-        finding_rule: Rule code from the original finding.
-        finding_line: Line number from the original finding.
-        category:     Category from the original finding.
-        fix:          The fix dict, or None if no fix was produced.
-        reason:       Human-readable explanation of why this is unresolvable.
+        rule:           Rule code of the covered finding.
+        lines:          Line number(s) the finding affects.
+        category:       Finding category, for the report matrix.
+        status:         Derived status — APPROVED / NEEDS_REVISION / UNRESOLVABLE.
+        suggested_code: The optimizer's fix, or None.
+        grounded_in:    Grounding sources from the optimizer.
+        reasoning:      Human-readable verdict reasoning.
+        faithfulness:   Faithfulness verdict, or None when no LLM call was made.
+        correctness:    Correctness verdict, or None.
+        completeness:   Completeness verdict, or None.
 
     Returns:
-        dict conforming to the fixes_evaluated entry schema with status UNRESOLVABLE.
+        dict conforming to the fixes_evaluated entry schema.
     """
-    if not isinstance(finding_rule, str):
-        logger.error("_unresolvable_entry: finding_rule must be str, got %s", type(finding_rule).__name__)
-        finding_rule = str(finding_rule)    # coerce rather than drop — losing the rule id is worse than a dirty string
-
-    if not isinstance(category, str):
-        logger.error("_unresolvable_entry: category must be str, got %s", type(category).__name__)
-        category = str(category)
-
-    if not isinstance(reason, str):
-        logger.error("_unresolvable_entry: reason must be str, got %s", type(reason).__name__)
-        reason = str(reason)
-
-    if fix is not None and not isinstance(fix, dict):
-        logger.error(
-            "_unresolvable_entry: fix must be a dict or None, got %s — treating as None",
-            type(fix).__name__,
-        )
-        fix = None  # a non-dict fix cannot be safely read; drop it to prevent AttributeError on .get()
-
     try:
         return {
-            "finding_rule": finding_rule,
-            "finding_line": finding_line,
-            "category":     category,
-            "status":       "UNRESOLVABLE",
-            "suggested_code": fix.get("suggested_code") if fix else None,
-            "grounded_in":    fix.get("grounded_in", []) if fix else [],
-            "reasoning":    reason,
-            "faithfulness": None,   # no LLM call was made — verdicts are undefined, not zero
-            "correctness":  None,
-            "completeness": None,
+            "rule":           rule if isinstance(rule, str) else str(rule),  # losing the rule id is worse than a coerced string
+            "lines":          lines,
+            "category":       category if isinstance(category, str) else str(category),
+            "status":         status,
+            "suggested_code": suggested_code,
+            "grounded_in":    grounded_in if isinstance(grounded_in, list) else [],
+            "reasoning":      reasoning if isinstance(reasoning, str) else str(reasoning),
+            "faithfulness":   faithfulness,
+            "correctness":    correctness,
+            "completeness":   completeness,
         }
+    except Exception as e:
+        logger.error("_evaluated_entry failed unexpectedly: %s", str(e))
+        return {
+            "rule": str(rule), "lines": lines, "category": "Unknown", "status": "UNRESOLVABLE",
+            "suggested_code": None, "grounded_in": [], "reasoning": f"Entry construction failed: {str(e)}",
+            "faithfulness": None, "correctness": None, "completeness": None,
+        }
+
+
+def _entries_for_fix(fix: dict, status: str, reasoning: str, verdicts: dict = None) -> list:
+    """
+    Fans one judged fix out to one evaluated entry per finding it covers.
+
+    Pipeline: called by run_evaluator (this module) after a fix is judged, or determined
+    UNRESOLVABLE without an LLM call. The single verdict is shared across every finding in
+    the fix's finding_keys, so a fix that resolved three conflicting findings produces three
+    report entries that all carry the same status and reasoning.
+
+    Args:
+        fix:       Optimizer fix dict with finding_keys, suggested_code, grounded_in.
+        status:    Derived status applied to every covered finding.
+        reasoning: Verdict reasoning applied to every covered finding.
+        verdicts:  Verdict dict (faithfulness/correctness/completeness), or None when no LLM
+                   call was made — then all three verdicts are None.
+
+    Returns:
+        List of fixes_evaluated entries, one per finding_key. A fix with no usable
+        finding_keys still yields one degraded UNRESOLVABLE entry so it never vanishes.
+    """
+    if not isinstance(fix, dict):
+        logger.error("_entries_for_fix: fix must be a dict, got %s", type(fix).__name__)
+        return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", None, [],
+                                 "Fix was not a dict — cannot evaluate.", None, None, None)]
+
+    try:
+        verdicts     = verdicts if isinstance(verdicts, dict) else {}
+        faithfulness = verdicts.get("faithfulness")
+        correctness  = verdicts.get("correctness")
+        completeness = verdicts.get("completeness")
+
+        suggested_code = fix.get("suggested_code")
+        grounded_in    = fix.get("grounded_in", [])
+        finding_keys   = fix.get("finding_keys")
+
+        # A fix with no identity still must surface once, attributed to nothing, rather than vanish.
+        if not isinstance(finding_keys, list) or not finding_keys:
+            logger.error("_entries_for_fix: fix has no usable finding_keys — emitting one degraded entry")
+            return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", suggested_code, grounded_in,
+                                     "Fix carried no finding identity — cannot attribute to a finding.",
+                                     None, None, None)]
+
+        entries = []
+        for key in finding_keys:
+            if not isinstance(key, dict):  # one malformed key must not drop the rest
+                logger.warning("_entries_for_fix: skipping non-dict finding_key: %s", type(key).__name__)
+                continue
+            entries.append(_evaluated_entry(
+                key.get("rule"),
+                key.get("lines"),
+                key.get("category", "Unknown"),
+                status,
+                suggested_code,
+                grounded_in,
+                reasoning,
+                faithfulness,
+                correctness,
+                completeness,
+            ))
+
+        if not entries:  # every key was malformed — still surface the fix once
+            return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", suggested_code, grounded_in,
+                                     "Fix finding_keys were all malformed — cannot attribute to a finding.",
+                                     None, None, None)]
+
+        return entries
 
     except Exception as e:
-        logger.error("_unresolvable_entry failed unexpectedly: %s", str(e))
-        return {
-            "finding_rule": finding_rule,
-            "finding_line": finding_line,
-            "category":     category,
-            "status":       "UNRESOLVABLE",
-            "suggested_code": None,
-            "grounded_in":    [],
-            "reasoning":    f"Entry construction failed: {str(e)}",
-            "faithfulness": None,
-            "correctness":  None,
-            "completeness": None,
-        }
+        logger.error("_entries_for_fix failed unexpectedly: %s", str(e))
+        return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", None, [],
+                                 f"Entry fan-out failed: {str(e)}", None, None, None)]
 
 # === AGENT LOOP ===
+
+def _issue_for_fix(fix: dict, enriched_findings: list) -> dict:
+    """
+    Assembles the issue context (rationale + best-practice refs) a fix is judged against.
+
+    Pipeline: called by run_evaluator (this module) for each fix with a real suggested_code,
+    before the LLM call. A fix may resolve several findings; this gathers the rationale and
+    refs of every finding it covers so the model judges the fix against all of them at once.
+
+    Why a lookup: the optimizer's fix carries finding identity (rule + lines) but not the
+    original rationale, so the issue text is recovered from enriched_findings by matching
+    rule and overlapping lines. Occurrences collapsed under one rule share a rationale, so an
+    exact per-occurrence match is unnecessary — overlapping lines is enough.
+
+    Args:
+        fix:               Optimizer fix dict with finding_keys.
+        enriched_findings: The Enricher's findings, source of rationale/best_practice_refs.
+
+    Returns:
+        dict with 'rationale' (combined, de-duplicated) and 'best_practice_refs' (combined,
+        de-duplicated). Returns empty strings/lists on invalid input or unexpected failure.
+    """
+    empty = {"rationale": "", "best_practice_refs": []}
+
+    if not isinstance(fix, dict):
+        logger.error("_issue_for_fix: fix must be a dict, got %s", type(fix).__name__)
+        return empty
+
+    if not isinstance(enriched_findings, list):
+        logger.error("_issue_for_fix: enriched_findings must be a list, got %s", type(enriched_findings).__name__)
+        return empty
+
+    try:
+        finding_keys = fix.get("finding_keys")
+        if not isinstance(finding_keys, list):
+            finding_keys = []
+
+        rationales = []  # ordered, de-duplicated: collapsed occurrences share one rationale
+        refs = []
+
+        for key in finding_keys:
+            if not isinstance(key, dict):
+                continue
+            key_rule    = key.get("rule")
+            key_lines   = key.get("lines") if isinstance(key.get("lines"), list) else []
+            key_lineset = set(key_lines)
+
+            for finding in enriched_findings:
+                if not isinstance(finding, dict) or finding.get("rule") != key_rule:
+                    continue
+                f_lines = finding.get("lines") if isinstance(finding.get("lines"), list) else []
+                # Match on overlapping lines so a collapsed multi-line finding still matches the
+                # single-line unit it was split into; an empty key line-set falls back to rule-only.
+                if key_lineset and not (key_lineset & set(f_lines)):
+                    continue
+
+                rationale = finding.get("rationale")
+                if isinstance(rationale, str) and rationale and rationale not in rationales:
+                    rationales.append(rationale)
+                for ref in finding.get("best_practice_refs", []) or []:
+                    if ref not in refs:
+                        refs.append(ref)
+
+        return {"rationale": "\n".join(rationales), "best_practice_refs": refs}
+
+    except Exception as e:
+        logger.error("_issue_for_fix failed unexpectedly: %s", str(e))
+        return empty
+
 
 async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict:
     """
@@ -379,119 +444,85 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
         }
 
     try:
-        pairs = _match_pairs(enriched_findings, fixes)  # links each finding to its fix by rule + line, once before the loop
         fixes_evaluated = []
 
-        for pair in pairs:
-            finding = pair["finding"]
-            fix     = pair["fix"]                               # None if optimizer produced no fix for this finding
+        # Drive off fixes, not findings: the optimizer already emits one fix-result per unit
+        # (real, null, or failure), so judging each fix once and fanning its verdict out to
+        # every finding it covers reconstructs the full per-finding report without re-matching.
+        for i, fix in enumerate(fixes):
+            if not isinstance(fix, dict):  # a non-dict fix cannot be judged — surface it, do not crash the loop
+                logger.warning("run_evaluator: fixes[%d] is not a dict (%s) — marking UNRESOLVABLE", i, type(fix).__name__)
+                fixes_evaluated.extend(_entries_for_fix(fix, "UNRESOLVABLE", "Optimizer fix entry was malformed."))
+                continue
 
-            finding_rule = finding.get("rule", "unknown")       # carried by orchestrator — LLM never sees these
-            finding_line = finding.get("line")                  # identity fields only needed for the output entry
-            category     = finding.get("category", "Unknown")   # needed by create_review_report for the category matrix
+            suggested_code = fix.get("suggested_code")
 
-            # No fix produced by optimizer → skip LLM call entirely
-            if fix is None or fix.get("suggested_code") is None:
-                # two cases: fix is None = optimizer produced no entry for this finding at all
-                #            suggested_code is None = optimizer ran but explicitly failed (recorded as unresolved)
-                # in both cases: no point calling the LLM — there is nothing to evaluate
-                logger.warning(
-                    "No fix for rule %s line %s — marking UNRESOLVABLE without LLM call",
-                    finding_rule, finding_line,
-                )
-                fixes_evaluated.append(_unresolvable_entry(
-                    finding_rule, finding_line, category,
-                    fix,
-                    reason="No fix was produced for this finding.",
-                ))
-                continue    # move to next pair — do not abort the whole loop
+            # No suggested code → optimizer produced no actionable fix; nothing to judge.
+            if suggested_code is None:
+                reason = fix.get("explanation") or "No fix was produced for this finding."
+                logger.warning("run_evaluator: fixes[%d] has null suggested_code — UNRESOLVABLE without LLM call", i)
+                fixes_evaluated.extend(_entries_for_fix(fix, "UNRESOLVABLE", reason))
+                continue
 
-        # Build minimal LLM input — strip identity/metadata fields
-            issue = {
-                "rationale":          finding.get("rationale", ""),
-                "best_practice_refs": finding.get("best_practice_refs", []),
-                # rule, line, severity, category deliberately excluded — the LLM does not need them to judge the fix, and extra fields invite hallucination
-            }
-
+            # Minimal LLM input: issue context recovered from the findings plus the fix's own
+            # output. Identity is deliberately excluded — matching is already done in Python.
+            issue     = _issue_for_fix(fix, enriched_findings)
             fix_input = {
-                "suggested_code": fix.get("suggested_code"),
+                "suggested_code": suggested_code,
                 "explanation":    fix.get("explanation", ""),
                 "grounded_in":    fix.get("grounded_in", []),
-                # finding_rule and finding_line excluded — matching is already done, LLM must not re-interpret identity
             }
 
-            logger.info("Evaluating rule %s line %s", finding_rule, finding_line)
+            logger.info(
+                "Evaluating fix %d/%d covering %d finding(s)",
+                i + 1, len(fixes), len(fix.get("finding_keys") or []),
+            )
             result = await _run_evaluator_pair(code, issue, fix_input)
 
-            # Layer 1a: agent ran out of iterations — expected budget failure, not a bug
+            # Layer 1a: agent ran out of iterations — predictable budget failure, not a bug.
             if result.get("status") == "max_iterations_reached":
-                logger.warning(
-                    "Max iterations reached for rule %s line %s — marking UNRESOLVABLE",
-                    finding_rule, finding_line,
-                )
-                fixes_evaluated.append(_unresolvable_entry(
-                    finding_rule, finding_line, category, fix,
-                    reason="Evaluator reached max iterations without producing a valid verdict.",
+                logger.warning("run_evaluator: fixes[%d] hit max iterations — marking UNRESOLVABLE", i)
+                fixes_evaluated.extend(_entries_for_fix(
+                    fix, "UNRESOLVABLE",
+                    "Evaluator reached max iterations without producing a valid verdict.",
                 ))
                 continue
 
-            # Layer 1b: unexpected error (API failure, network issue, etc.)
+            # Layer 1b: unexpected error (API failure, network issue, etc.).
             if result.get("status") == "error":
-                logger.error(
-                    "Unexpected error for rule %s line %s: %s",
-                    finding_rule, finding_line, result.get("message", "unknown error"),
-                )
-                fixes_evaluated.append(_unresolvable_entry(
-                    finding_rule, finding_line, category, fix,
-                    reason=f"Unexpected error during evaluation: {result.get('message', 'unknown error')}",
+                logger.error("run_evaluator: fixes[%d] errored: %s", i, result.get("message", "unknown error"))
+                fixes_evaluated.extend(_entries_for_fix(
+                    fix, "UNRESOLVABLE",
+                    f"Unexpected error during evaluation: {result.get('message', 'unknown error')}",
                 ))
                 continue
 
-            # Validate model output before use: a partial tool call can still reach here,
-            # and guessing a missing field is worse than failing loudly.
+            # Validate model output before use: a partial tool call can still reach here, and
+            # guessing a missing verdict is worse than failing loudly.
             evaluation = result.get("evaluation")
             if not isinstance(evaluation, dict):
-                logger.error(
-                    "Rule %s line %s: response has no 'evaluation' dict — type was %s",
-                    finding_rule, finding_line, type(evaluation).__name__,
-                )
-                fixes_evaluated.append(_unresolvable_entry(
-                    finding_rule, finding_line, category, fix,
-                    reason="Evaluator returned malformed output — no evaluation dict present.",
+                logger.error("run_evaluator: fixes[%d] — no 'evaluation' dict (got %s)", i, type(evaluation).__name__)
+                fixes_evaluated.extend(_entries_for_fix(
+                    fix, "UNRESOLVABLE", "Evaluator returned malformed output — no evaluation dict present.",
                 ))
                 continue
 
             required = ["reasoning", "faithfulness", "correctness", "completeness"]
             missing  = [f for f in required if f not in evaluation]
             if missing:
-                logger.error(
-                    "Rule %s line %s: evaluation dict missing fields %s",
-                    finding_rule, finding_line, missing,
-                )
-                fixes_evaluated.append(_unresolvable_entry(
-                    finding_rule, finding_line, category, fix,
-                    reason=f"Evaluator returned incomplete verdicts — missing: {missing}",
+                logger.error("run_evaluator: fixes[%d] — evaluation missing fields %s", i, missing)
+                fixes_evaluated.extend(_entries_for_fix(
+                    fix, "UNRESOLVABLE", f"Evaluator returned incomplete verdicts — missing: {missing}",
                 ))
                 continue
 
             status = _derive_status(evaluation)
             logger.info(
-                "Rule %s line %s → %s | faith=%s correct=%s complete=%s",
-                finding_rule, finding_line, status,
-                evaluation["faithfulness"], evaluation["correctness"], evaluation["completeness"],
+                "run_evaluator: fixes[%d] → %s | faith=%s correct=%s complete=%s",
+                i, status, evaluation["faithfulness"], evaluation["correctness"], evaluation["completeness"],
             )
-            fixes_evaluated.append({
-                "finding_rule": finding_rule,                   # orchestrator supplies identity — LLM never carried this
-                "finding_line": finding_line,
-                "category":     category,                       # orchestrator supplies category for report matrix
-                "status":       status,                         # derived deterministically in Python, not by LLM
-                "suggested_code": fix.get("suggested_code"),    # passed through unchanged from optimizer
-                "grounded_in":  fix.get("grounded_in", []),     # passed through unchanged from optimizer
-                "reasoning":    evaluation["reasoning"],        # from LLM
-                "faithfulness": evaluation["faithfulness"],     # from LLM
-                "correctness":  evaluation["correctness"],      # from LLM
-                "completeness": evaluation["completeness"],     # from LLM
-            })
+            # One verdict, fanned out to every finding this fix resolved.
+            fixes_evaluated.extend(_entries_for_fix(fix, status, evaluation["reasoning"], evaluation))
 
         open_findings  = [e for e in fixes_evaluated if e["status"] == "UNRESOLVABLE"]
         approved       = sum(1 for e in fixes_evaluated if e["status"] == "APPROVED")
@@ -559,16 +590,36 @@ if __name__ == "__main__":
     setup_logging()
 
     test_code = (
-        "import os\n"
+        "import os, sys\n"
         "def get_user(id):\n"
         "    query = 'SELECT * FROM users WHERE id = ' + id\n"
         "    return query\n"
     )
 
+    # Findings carry `lines` only (no `line`). _issue_for_fix recovers each fix's rationale
+    # from here by matching rule + overlapping lines.
     test_enriched_findings = [
         {
+            "rule": "E401",
+            "lines": [1],
+            "category": "Style",
+            "severity": "LOW",
+            "rationale": "Multiple imports on one line should be split onto separate lines.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/multiple-imports-on-one-line",
+        },
+        {
+            "rule": "F401",
+            "lines": [1],
+            "category": "Logic",
+            "severity": "LOW",
+            "rationale": "'os' is imported but never used and should be removed.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/unused-import",
+        },
+        {
             "rule": "B608",
-            "line": 3,
+            "lines": [3],
             "category": "Security",
             "severity": "HIGH",
             "rationale": "String-based SQL query construction allows injection attacks.",
@@ -581,12 +632,34 @@ if __name__ == "__main__":
             ],
             "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",
         },
+        {
+            "rule": "W291",
+            "lines": [1],
+            "category": "Style",
+            "severity": "LOW",
+            "rationale": "Trailing whitespace should be removed.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/trailing-whitespace",
+        },
     ]
 
+    # Fixes mirror real Optimizer output: each carries finding_keys plus the model's own
+    # output. Three shapes are exercised: a multi-finding fix (fans out to two report
+    # entries), a single-finding fix, and a null fix (UNRESOLVABLE without an LLM call).
     test_fixes = [
         {
-            "finding_rule": "B608",
-            "finding_line": 3,
+            "finding_keys": [
+                {"rule": "E401", "lines": [1], "category": "Style"},
+                {"rule": "F401", "lines": [1], "category": "Logic"},
+            ],
+            "suggested_code": "import sys\n",
+            "explanation": "Removed the unused 'os' import and split the combined import line.",
+            "grounded_in": ["pyguide §2.1"],
+        },
+        {
+            "finding_keys": [
+                {"rule": "B608", "lines": [3], "category": "Security"},
+            ],
             "suggested_code": (
                 "def get_user(id):\n"
                 "    query = 'SELECT * FROM users WHERE id = ?'\n"
@@ -594,6 +667,14 @@ if __name__ == "__main__":
             ),
             "explanation": "Replaced string concatenation with a parameterized query.",
             "grounded_in": ["company_rules §1.3"],
+        },
+        {
+            "finding_keys": [
+                {"rule": "W291", "lines": [1], "category": "Style"},
+            ],
+            "suggested_code": None,
+            "explanation": "Optimizer did not return a fix for this finding.",
+            "grounded_in": [],
         },
     ]
 

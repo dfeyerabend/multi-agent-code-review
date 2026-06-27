@@ -13,7 +13,12 @@ logger = logging.getLogger(__name__)
 _fix_schema = {
     "type": "object",
     "properties": {
-        "index":          {"type": "integer"},  # batch-local position of the finding this fix addresses
+        # a list, not a scalar: one fix may resolve several findings that share a line
+        # (e.g. E401 + two F401 on "import os, sys") in a single coherent rewrite
+        "indexes": {
+            "type": "array",
+            "items": {"type": "integer"},        # batch-local positions of the findings this fix addresses
+        },
         "suggested_code": {"type": "string"},   # the corrected code snippet
         "explanation":    {"type": "string"},   # why this fix resolves the issue
         "grounded_in": {
@@ -30,8 +35,10 @@ optimizer_local_tools = [
         "name": "submit_optimization",
         "description": (
             "Submit the final fix suggestions after generating a fix for every finding "
-            "in the batch. Reference each finding by its 'index' field only — do NOT "
-            "repeat finding_rule or finding_line, those are attached automatically. "
+            "in the batch. Reference the finding(s) each fix resolves by their 'indexes' "
+            "(a list) only — do NOT repeat finding_rule or finding_line, those are "
+            "attached automatically. When several findings share the same line(s) and were "
+            "given to you together, resolve them with ONE fix listing ALL their indexes. "
             "You MUST call this tool as your final step. "
             "Do NOT respond with plain text — always submit through this tool."
         ),
@@ -41,7 +48,9 @@ optimizer_local_tools = [
                 "fixes": {
                     "type": "array",
                     "description": (
-                        "One fix entry per finding in the batch, referenced by 'index'. "
+                        "One fix entry per group of findings, each referencing the findings "
+                        "it resolves by their 'indexes'. A fix for a single finding lists one "
+                        "index; a fix for several findings sharing a line lists them all. "
                         "Empty list if no actionable fix could be generated."
                     ),
                     "items": _fix_schema,
@@ -111,8 +120,14 @@ def run_optimizer_tool(name: str, tool_input: dict) -> str:
             if not isinstance(fix, dict):
                 fix_errors.append(f"fixes[{i}]: must be an object, got {type(fix).__name__}")
                 continue
-            if not isinstance(fix.get("index"), int) or isinstance(fix.get("index"), bool):
-                fix_errors.append(f"fixes[{i}]: 'index' must be an integer")
+            # indexes must be a non-empty int list — an empty list would attach this fix to
+            # no finding, silently dropping the model's work; bool is an int subclass in
+            # Python, so reject it explicitly to avoid True/False sneaking in as a position.
+            indexes = fix.get("indexes")
+            if not isinstance(indexes, list) or not indexes:
+                fix_errors.append(f"fixes[{i}]: 'indexes' must be a non-empty list of integers")
+            elif not all(isinstance(n, int) and not isinstance(n, bool) for n in indexes):
+                fix_errors.append(f"fixes[{i}]: 'indexes' must contain only integers")
             if "suggested_code" in fix and fix["suggested_code"] is not None and not isinstance(
                     fix["suggested_code"], str):
                 fix_errors.append(f"fixes[{i}]: 'suggested_code' must be a string or null")

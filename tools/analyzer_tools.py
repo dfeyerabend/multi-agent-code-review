@@ -55,10 +55,10 @@ def _deduplicate_findings(findings: list) -> list:
         findings: List of finding dicts from ruff or bandit.
 
     Returns:
-        Deduplicated list where each (rule, message) appears once. 'line' keeps
-        the first occurrence so a usable line number always survives downstream;
-        'lines' lists every affected line and 'occurrences' counts them. Returns
-        an empty list on unexpected failure rather than raising.
+        Deduplicated list where each (rule, message) appears once. 'lines' lists
+        every affected line (1-based) and 'occurrences' counts them; the scalar
+        'line' is dropped — 'lines' is the single source of truth downstream.
+        Returns an empty list on unexpected failure rather than raising.
     """
     if not isinstance(findings, list):
         logger.error("_deduplicate_findings: expected list, got %s", type(findings).__name__)
@@ -78,7 +78,12 @@ def _deduplicate_findings(findings: list) -> list:
             key = (finding.get("rule", "unknown"), finding.get("message", ""))
 
             if key not in seen:
-                seen[key] = {**finding, "lines": [finding.get("line")], "occurrences": 1}
+                # strip the scalar `line` from the output — `lines` is the single source of
+                # truth downstream; the raw `line` is still read here to seed that list.
+                collapsed = {k: v for k, v in finding.items() if k != "line"}
+                collapsed["lines"] = [finding.get("line")]
+                collapsed["occurrences"] = 1
+                seen[key] = collapsed
                 order.append(key)
             else:
                 seen[key]["lines"].append(finding.get("line"))

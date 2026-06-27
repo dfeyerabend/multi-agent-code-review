@@ -86,8 +86,8 @@ def _merge_enrichment(findings_batch: list, enrichments: list) -> list:
                 # A finding the model never addressed must still surface downstream,
                 # just flagged clearly rather than silently dropped.
                 logger.warning(
-                    "_merge_enrichment: no enrichment for finding index=%s rule=%s line=%s",
-                    idx, finding.get("rule"), finding.get("line"),
+                    "_merge_enrichment: no enrichment for finding index=%s rule=%s lines=%s",
+                    idx, finding.get("rule"), finding.get("lines"),
                 )
                 enriched["rationale"] = "Enrichment missing — model did not address this finding."
                 enriched["best_practice_refs"] = []
@@ -388,10 +388,10 @@ if __name__ == "__main__":
     setup_logging()
 
     test_findings = [
-        {"rule": "F401", "message": "`os` imported but unused", "line": 1, "lines": [1], "occurrences": 1,
+        {"rule": "F401", "message": "`os` imported but unused", "lines": [1], "occurrences": 1,
          "severity": "LOW", "category": "Logic",
          "doc_url": "https://docs.astral.sh/ruff/rules/unused-import"},
-        {"rule": "B608", "message": "Possible SQL injection via string-based query construction", "line": 3,
+        {"rule": "B608", "message": "Possible SQL injection via string-based query construction",
          "lines": [3, 17], "occurrences": 2,
          "severity": "MEDIUM", "category": "Security",
          "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",

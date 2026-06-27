@@ -43,7 +43,7 @@ def test_submit_analysis_unknown_tool_name():
 # === _deduplicate_findings ===
 
 def test_deduplicate_findings_collapses_same_rule():
-    """Multiple findings with the same rule collapse into one entry, keeping the first line."""
+    """Multiple findings with the same rule collapse into one entry; lines lists them all."""
     findings = [
         {"rule": "E501", "message": "Line too long", "line": 10, "severity": "LOW"},
         {"rule": "E501", "message": "Line too long", "line": 22, "severity": "LOW"},
@@ -53,7 +53,7 @@ def test_deduplicate_findings_collapses_same_rule():
 
     assert len(deduped) == 1                          # 3 occurrences collapsed into 1
     assert deduped[0]["rule"] == "E501"
-    assert deduped[0]["line"] == 10                   # first occurrence preserved for downstream agents
+    assert "line" not in deduped[0]                   # scalar line dropped — lines is the source of truth
     assert deduped[0]["lines"] == [10, 22, 45]
     assert deduped[0]["occurrences"] == 3
 

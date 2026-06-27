@@ -35,69 +35,226 @@ LOCAL_TOOL_NAMES = {t["name"] for t in optimizer_local_tools}
 
 # === HELPER FUNCTIONS ===
 
-def _route_findings(findings: list) -> tuple[list, dict[str, list]]:
+def _explode_repeats(findings: list) -> list:
     """
-    Splits findings into individual and grouped buckets for routing.
+    Splits repetitive findings into one single-line unit per affected line.
 
-    Pipeline: called once by run_optimizer after MCP session opens, before
-    any LLM calls. Determines which findings get their own call and which
-    are batched together by rule code.
+    Pipeline: called by run_optimizer (this module) as the first step on the enriched
+    findings, before _group_overlapping and _route_findings.
 
-    Style findings are grouped by rule code so all instances of the same
-    rule (e.g. 20 × W291) are resolved in one LLM call. Security, Logic,
-    and Maintainability findings get individual calls by default — mixed
-    context degrades fix quality for complex issues.
-
-    Config overrides (OPTIMIZER_FORCE_GROUPED / OPTIMIZER_FORCE_INDIVIDUAL)
-    let specific rule IDs opt out of the default without changing this logic.
+    A finding with occurrences > 1 is the same problem firing on several lines (e.g.
+    W291 trailing whitespace on lines [2, 4]) that _deduplicate_findings (in
+    tools/analyzer_tools.py) collapsed into one entry. During line-overlap grouping a
+    multi-line entry would act as "glue", dragging unrelated lines into one giant batch.
+    Splitting it into single-line units removes that glue and is lossless — the
+    occurrences shared one identical message, so every unit inherits the same rationale.
+    The gate is occurrences > 1, not len(lines) > 1: occurrences is what actually means
+    "repetition", so a genuine single multi-line span (if ever introduced upstream) is
+    left intact instead of being shattered into meaningless per-line fragments.
 
     Args:
         findings: List of enriched finding dicts from the Enricher.
 
     Returns:
-        Tuple of:
-        - individual_findings: flat list, one LLM call each.
-        - style_groups: dict mapping rule_code → list of findings,
-          one LLM call per group (chunked later at OPTIMIZER_STYLE_BATCH_SIZE).
-        Returns ([], {}) on invalid input or unexpected failure.
+        Flat list of finding dicts where no entry spans more than one line. Repetitive
+        findings are expanded; all others pass through unchanged. Returns [] on invalid
+        input, or the original findings unchanged on unexpected failure so the pipeline
+        degrades without losing findings.
     """
     if not isinstance(findings, list):
-        logger.error("_route_findings: findings must be a list, got %s", type(findings).__name__)
-        return [], {}
+        logger.error("_explode_repeats: findings must be a list, got %s", type(findings).__name__)
+        return []
 
     try:
-        individual_findings = []
+        units = []
+        for finding in findings:
+            try:
+                if not isinstance(finding, dict):  # a non-dict finding cannot be exploded — skip, don't crash the batch
+                    logger.warning("_explode_repeats: skipping non-dict finding: %s", type(finding).__name__)
+                    continue
+
+                occurrences = finding.get("occurrences")
+                lines       = finding.get("lines")
+
+                # A finding with no usable `lines` cannot be split or grouped on a line; pass
+                # it through untouched so it is never dropped — grouping later isolates it as
+                # its own singleton rather than crashing.
+                if not isinstance(lines, list) or not lines:
+                    logger.warning(
+                        "_explode_repeats: finding has no usable lines (rule %s) — passing through unchanged",
+                        finding.get("rule"),
+                    )
+                    units.append(finding)
+                    continue
+
+                # Repetition is the only multi-line case in this pipeline; gate on occurrences,
+                # falling back to the line count only when occurrences is missing/malformed.
+                occ = occurrences if isinstance(occurrences, int) and not isinstance(occurrences, bool) else len(lines)
+
+                if occ > 1:
+                    for ln in lines:
+                        units.append({**finding, "lines": [ln], "occurrences": 1})
+                else:
+                    units.append(finding)
+
+            except Exception as e:
+                # one malformed finding must not drop its siblings — pass it through unexploded
+                logger.error("_explode_repeats: failed to process finding %r: %s", finding, str(e))
+                units.append(finding)
+
+        logger.info("_explode_repeats: %d finding(s) → %d single-line unit(s)", len(findings), len(units))
+        return units
+
+    except Exception as e:
+        logger.error("_explode_repeats failed unexpectedly: %s", str(e))
+        return findings  # degrade gracefully: no explosion, but no findings lost
+
+
+def _group_overlapping(units: list) -> list:
+    """
+    Groups units whose line-sets intersect into connected components.
+
+    Pipeline: called by run_optimizer (this module) on the single-line units produced by
+    _explode_repeats, before each group is routed to an LLM call.
+
+    Two units belong together when they touch a common physical line, and the grouping is
+    transitive — A with B and B with C puts all three in one group — so every problem on a
+    line is resolved in one coherent call. Because _explode_repeats already removed
+    multi-line repeats, no unit can bridge unrelated lines, which keeps groups local
+    instead of collapsing the whole file into one batch. A unit with no usable line owns no
+    lines and therefore lands in its own singleton group rather than crashing.
+
+    Args:
+        units: List of single-line finding units from _explode_repeats.
+
+    Returns:
+        List of groups, each a non-empty list of units. A non-overlapping unit yields a
+        group of one. Returns [] on invalid input; on unexpected failure, falls back to one
+        group per unit so nothing merges wrongly and no unit is lost.
+    """
+    if not isinstance(units, list):
+        logger.error("_group_overlapping: units must be a list, got %s", type(units).__name__)
+        return []
+
+    try:
+        # Build each unit's set of physical lines once. A non-dict or line-less unit gets an
+        # empty set, which never intersects anything and so stays its own singleton.
+        line_sets = []
+        for unit in units:
+            if not isinstance(unit, dict):
+                logger.warning("_group_overlapping: non-dict unit isolated as singleton: %s", type(unit).__name__)
+                line_sets.append(set())
+                continue
+            lines = unit.get("lines")
+            if not isinstance(lines, list):
+                lines = []
+            usable = {ln for ln in lines if isinstance(ln, int) and not isinstance(ln, bool)}
+            if not usable:
+                logger.warning("_group_overlapping: unit has no usable line (rule %s) — isolating as singleton", unit.get("rule"))
+            line_sets.append(usable)
+
+        # Connected components by shared line: each component tracks its accumulated line-set
+        # and its units. A new unit folds every component it touches into the first match,
+        # which makes the grouping transitive across chains of overlaps.
+        components = []
+        for unit, lset in zip(units, line_sets):
+            hits = [c for c in components if c["lines"] & lset]
+            if not hits:
+                components.append({"lines": set(lset), "units": [unit]})
+                continue
+            target = hits[0]
+            target["units"].append(unit)
+            target["lines"] |= lset
+            for other in hits[1:]:               # absorb any further components this unit bridges
+                target["units"].extend(other["units"])
+                target["lines"] |= other["lines"]
+                components.remove(other)
+
+        groups = [c["units"] for c in components]
+        logger.info("_group_overlapping: %d unit(s) → %d group(s)", len(units), len(groups))
+        return groups
+
+    except Exception as e:
+        logger.error("_group_overlapping failed unexpectedly: %s", str(e))
+        return [[u] for u in units]   # degrade: isolate every unit, lose nothing
+
+
+def _route_findings(groups: list) -> tuple[list, list, dict[str, list]]:
+    """
+    Classifies overlap-groups into conflict batches, individual calls, and style rule-batches.
+
+    Pipeline: called once by run_optimizer after _explode_repeats and _group_overlapping,
+    before any LLM calls. Decides how many calls happen and which units share each one.
+
+    A group with more than one unit is a genuine line conflict (e.g. E401 + two F401 on the
+    same line): it always becomes ONE batch so a single coherent fix covers all of them,
+    regardless of category — this is why a conflict group takes precedence over the Style
+    rule-code batching below. A group of one is routed exactly as before this change: Style
+    units batch by rule code (so 25 × W291 share one call), Security/Logic/Maintainability
+    units get their own call. The OPTIMIZER_FORCE_GROUPED / OPTIMIZER_FORCE_INDIVIDUAL
+    overrides let specific rule IDs opt out of their default.
+
+    Args:
+        groups: List of unit-groups from _group_overlapping; each group is a list of 1+ units.
+
+    Returns:
+        Tuple of:
+        - conflict_groups: list of groups (each 2+ units), one batch LLM call each.
+        - individual_units: flat list of units, one LLM call each.
+        - style_groups: dict mapping rule_code → list of units, rule-batched later
+          (chunked at OPTIMIZER_STYLE_BATCH_SIZE).
+        Returns ([], [], {}) on invalid input or unexpected failure.
+    """
+    if not isinstance(groups, list):
+        logger.error("_route_findings: groups must be a list, got %s", type(groups).__name__)
+        return [], [], {}
+
+    try:
+        conflict_groups: list = []
+        individual_units: list = []
         style_groups: dict[str, list] = {}
 
-        for finding in findings:
-            if not isinstance(finding, dict):  # a non-dict finding cannot be routed — skip rather than crash the whole batch
-                logger.warning("_route_findings: skipping non-dict finding: %s", type(finding).__name__)
+        for group in groups:
+            if not isinstance(group, list) or not group:  # a malformed/empty group cannot be routed — skip rather than crash
+                logger.warning("_route_findings: skipping malformed group: %r", group)
                 continue
 
-            category  = finding.get("category", "")
-            rule_code = finding.get("rule", "unknown")
+            # More than one unit means these lines genuinely overlap: one merged fix, no
+            # category split — the conflict batch wins over style rule-code grouping.
+            if len(group) > 1:
+                conflict_groups.append(group)
+                continue
+
+            unit = group[0]
+            if not isinstance(unit, dict):  # a non-dict singleton cannot be routed — skip rather than crash
+                logger.warning("_route_findings: skipping non-dict unit: %s", type(unit).__name__)
+                continue
+
+            category  = unit.get("category", "")
+            rule_code = unit.get("rule", "unknown")
 
             if category == "Style" and rule_code not in OPTIMIZER_FORCE_INDIVIDUAL:
-                style_groups.setdefault(rule_code, []).append(finding)
+                style_groups.setdefault(rule_code, []).append(unit)
 
             elif category != "Style" and rule_code in OPTIMIZER_FORCE_GROUPED:
                 # Config override: treat this Security/Logic/Maintainability rule as grouped
-                style_groups.setdefault(rule_code, []).append(finding)
+                style_groups.setdefault(rule_code, []).append(unit)
 
             else:
-                individual_findings.append(finding)
+                individual_units.append(unit)
 
         logger.info(
-            "_route_findings: %d individual | %d style group(s) covering %d finding(s)",
-            len(individual_findings),
+            "_route_findings: %d conflict group(s) | %d individual | %d style group(s) covering %d unit(s)",
+            len(conflict_groups),
+            len(individual_units),
             len(style_groups),
             sum(len(v) for v in style_groups.values()),
         )
-        return individual_findings, style_groups
+        return conflict_groups, individual_units, style_groups
 
     except Exception as e:
         logger.error("_route_findings failed unexpectedly: %s", str(e))
-        return [], {}
+        return [], [], {}
 
 
 def _extract_final_output(messages: list, final_response) -> dict:
@@ -147,114 +304,131 @@ def _extract_final_output(messages: list, final_response) -> dict:
         return {"status": "error", "message": f"Unexpected error extracting output: {str(e)}"}
 
 
-def _merge_fixes(findings_batch: list, fixes: list) -> list:
+def _merge_fixes(units_batch: list, fixes: list) -> list:
     """
-    Reattaches finding identity (finding_rule, finding_line, lines, category) from the
-    original findings onto the model's index-keyed fix output.
+    Fans each fix out to the identity of every unit its `indexes` cover.
 
-    Pipeline: called by _run_optimizer_batch after a successful submit_optimization
-    result, before the batch's fixes are returned to run_optimizer.
+    Pipeline: called by _run_optimizer_batch (this module) after a successful
+    submit_optimization result, before the batch's fixes are returned to run_optimizer.
 
-    Identity fields must never come from the model — see the de-laundering rule in
-    CLAUDE.md. findings_batch entries carry an 'index' field (attached by
-    _run_optimizer_batch before the LLM call) that fixes reference to say which
-    finding they address.
+    Identity (rule, lines, category) must never come from the model — see the de-laundering
+    rule in CLAUDE.md. units_batch entries carry an 'index' field (attached by
+    _run_optimizer_batch before the LLM call) that fixes reference via their 'indexes' list
+    to say which units they resolve. One fix may cover several units (a line conflict
+    resolved in one rewrite); its identity is the list `finding_keys`, one
+    {rule, lines, category} per covered unit. category is carried per unit because a
+    conflict group can mix categories (e.g. Style E401 + Logic F401 on one line).
 
     Args:
-        findings_batch: Findings sent to the model for this batch, each with an
-                         'index' field already attached.
-        fixes:          Validated fix list from submit_optimization, each item
-                         carrying 'index', 'suggested_code', 'explanation', 'grounded_in'.
+        units_batch: Units sent to the model for this batch, each with an 'index' field.
+        fixes:       Validated fix list from submit_optimization, each carrying 'indexes',
+                     'suggested_code', 'explanation', 'grounded_in'.
 
     Returns:
-        List of merged fix dicts, one per finding in findings_batch, in the same
-        finding_rule/finding_line/suggested_code/explanation/grounded_in shape the
-        Evaluator already expects, plus carried-through lines/category. A finding
-        with no matching fix gets a null-suggested_code entry instead of being dropped.
+        List of fix-result dicts, one per fix, each with finding_keys plus the model's
+        suggested_code/explanation/grounded_in. Every unit with no covering fix still gets
+        its own null-suggested_code entry so it is never dropped from the report.
     """
-    if not isinstance(findings_batch, list):
-        logger.error("_merge_fixes: findings_batch must be a list, got %s", type(findings_batch).__name__)
+    if not isinstance(units_batch, list):
+        logger.error("_merge_fixes: units_batch must be a list, got %s", type(units_batch).__name__)
         return []
 
     if not isinstance(fixes, list):
         logger.error("_merge_fixes: fixes must be a list, got %s", type(fixes).__name__)
-        fixes = []  # treat as no fixes — every finding still needs an entry, see fallback below
+        fixes = []  # treat as no fixes — every unit still needs an entry, see fallback below
 
     try:
-        # Index the model's fixes once so each finding can look itself up by position,
-        # not by retyped identity — that lookup IS the de-laundering boundary.
-        fixes_by_index = {}
-        for i, fix in enumerate(fixes):
-            if not isinstance(fix, dict):
-                logger.warning("_merge_fixes: skipping fixes[%d] — not a dict (%s)", i, type(fix).__name__)
-                continue
-            idx = fix.get("index")
-            if not isinstance(idx, int) or isinstance(idx, bool):
-                logger.warning("_merge_fixes: skipping fixes[%d] — invalid index %r", i, idx)
-                continue
-            fixes_by_index[idx] = fix
+        # Index the batch units once so a fix can resolve each index it lists back to real
+        # identity — that lookup IS the de-laundering boundary (Python carries identity, not the LLM).
+        units_by_index = {}
+        for unit in units_batch:
+            if isinstance(unit, dict) and isinstance(unit.get("index"), int) and not isinstance(unit.get("index"), bool):
+                units_by_index[unit["index"]] = unit
 
         merged = []
-        for finding in findings_batch:
-            try:
-                idx = finding.get("index")
-                fix = fixes_by_index.get(idx)
+        covered_indexes = set()
 
-                if fix is None:  # model never addressed this finding — must not silently vanish from the report
-                    logger.warning(
-                        "_merge_fixes: no fix for finding index %s (rule %s line %s) — emitting null fix",
-                        idx, finding.get("rule"), finding.get("line"),
-                    )
-                    merged.append({
-                        "finding_rule": finding.get("rule"),
-                        "finding_line": finding.get("line"),
-                        "lines": finding.get("lines"),
-                        "category": finding.get("category"),
-                        "suggested_code": None,
-                        "explanation": "Optimizer did not return a fix for this finding.",
-                        "grounded_in": [],
+        for i, fix in enumerate(fixes):
+            try:
+                if not isinstance(fix, dict):
+                    logger.warning("_merge_fixes: skipping fixes[%d] — not a dict (%s)", i, type(fix).__name__)
+                    continue
+
+                indexes = fix.get("indexes")
+                if not isinstance(indexes, list) or not indexes:  # validated upstream, but never trust LLM output unchecked
+                    logger.warning("_merge_fixes: skipping fixes[%d] — invalid indexes %r", i, indexes)
+                    continue
+
+                # Build identity for every covered unit; an index with no matching unit is
+                # dropped from this fix's keys and logged, never guessed.
+                finding_keys = []
+                for idx in indexes:
+                    unit = units_by_index.get(idx)
+                    if unit is None:
+                        logger.warning("_merge_fixes: fixes[%d] references unknown index %r — ignoring", i, idx)
+                        continue
+                    finding_keys.append({
+                        "rule":     unit.get("rule"),
+                        "lines":    unit.get("lines"),
+                        "category": unit.get("category"),
                     })
+                    covered_indexes.add(idx)
+
+                if not finding_keys:  # the fix resolved no real unit — do not emit an identity-less entry
+                    logger.warning("_merge_fixes: fixes[%d] covered no known unit — dropped", i)
                     continue
 
                 merged.append({
-                    "finding_rule": finding.get("rule"),
-                    "finding_line": finding.get("line"),
-                    "lines": finding.get("lines"),
-                    "category": finding.get("category"),
+                    "finding_keys":   finding_keys,
                     "suggested_code": fix.get("suggested_code"),
-                    "explanation": fix.get("explanation", ""),
-                    "grounded_in": fix.get("grounded_in", []),
+                    "explanation":    fix.get("explanation", ""),
+                    "grounded_in":    fix.get("grounded_in", []),
                 })
 
             except Exception as e:
-                # one malformed finding must not drop the rest of the batch from the report
-                logger.error("_merge_fixes: failed to merge finding %r: %s", finding, str(e))
-                merged.append({
-                    "finding_rule": finding.get("rule") if isinstance(finding, dict) else None,
-                    "finding_line": finding.get("line") if isinstance(finding, dict) else None,
-                    "lines": finding.get("lines") if isinstance(finding, dict) else None,
-                    "category": finding.get("category") if isinstance(finding, dict) else None,
-                    "suggested_code": None,
-                    "explanation": f"Optimizer merge failed for this finding: {str(e)}",
-                    "grounded_in": [],
-                })
+                # one malformed fix must not drop the rest of the batch
+                logger.error("_merge_fixes: failed to merge fixes[%d]: %s", i, str(e))
+                continue
+
+        # Any unit the model never addressed must still surface — one null fix per uncovered unit.
+        for unit in units_batch:
+            if not isinstance(unit, dict):
+                continue
+            idx = unit.get("index")
+            if idx in covered_indexes:
+                continue
+            logger.warning(
+                "_merge_fixes: no fix for unit index %s (rule %s lines %s) — emitting null fix",
+                idx, unit.get("rule"), unit.get("lines"),
+            )
+            merged.append({
+                "finding_keys": [{
+                    "rule":     unit.get("rule"),
+                    "lines":    unit.get("lines"),
+                    "category": unit.get("category"),
+                }],
+                "suggested_code": None,
+                "explanation": "Optimizer did not return a fix for this finding.",
+                "grounded_in": [],
+            })
 
         return merged
 
     except Exception as e:
         logger.error("_merge_fixes failed unexpectedly: %s", str(e))
-        # last-resort fallback: still emit one null-fix entry per finding rather than dropping the batch
+        # last-resort fallback: one null-fix entry per unit rather than dropping the batch
         return [
             {
-                "finding_rule": f.get("rule") if isinstance(f, dict) else None,
-                "finding_line": f.get("line") if isinstance(f, dict) else None,
-                "lines": f.get("lines") if isinstance(f, dict) else None,
-                "category": f.get("category") if isinstance(f, dict) else None,
+                "finding_keys": [{
+                    "rule":     u.get("rule"),
+                    "lines":    u.get("lines"),
+                    "category": u.get("category"),
+                }],
                 "suggested_code": None,
                 "explanation": f"Optimizer merge failed unexpectedly: {str(e)}",
                 "grounded_in": [],
             }
-            for f in findings_batch if isinstance(f, dict)
+            for u in units_batch if isinstance(u, dict)
         ]
 
 # === AGENT LOOP ===
@@ -274,9 +448,9 @@ async def _run_optimizer_batch(
 
     Each finding gets a batch-local 'index' attached before being sent to the
     model, so the model can reference findings without retyping their identity.
-    After a successful submit_optimization call, _merge_fixes reattaches
-    finding_rule/finding_line/lines/category from the original findings —
-    those fields are never trusted from the model's output.
+    After a successful submit_optimization call, _merge_fixes reattaches each
+    fix's finding_keys (rule/lines/category per covered finding) from the original
+    findings — that identity is never trusted from the model's output.
 
     Args:
         code:           Full source code string, passed once per batch.
@@ -307,7 +481,7 @@ async def _run_optimizer_batch(
 
     try:
         # Tag each finding with its batch-local position so the model can reference
-        # it by index instead of retyping finding_rule/finding_line into its output.
+        # it by index instead of retyping its identity (rule/lines) into its output.
         indexed_batch = [
             {**finding, "index": i} if isinstance(finding, dict) else finding
             for i, finding in enumerate(findings_batch)
@@ -476,6 +650,37 @@ async def run_optimizer_group(
         return {"status": "error", "message": f"Unexpected error in run_optimizer_group: {str(e)}"}
 
 
+def _failure_fix(units: list, explanation: str) -> dict:
+    """
+    Builds one null-suggested fix-result entry covering the given units.
+
+    Pipeline: called by run_optimizer (this module) on every call-failure path so a failed
+    group still surfaces in the report instead of vanishing. Mirrors the finding_keys shape
+    _merge_fixes produces for successful fixes, so the Evaluator sees one consistent contract.
+
+    Args:
+        units:       Units the failed call was meant to fix (1+).
+        explanation: Human-readable reason the fix is missing.
+
+    Returns:
+        Fix-result dict with finding_keys for every dict unit and suggested_code=None.
+    """
+    try:
+        keys = [
+            {"rule": u.get("rule"), "lines": u.get("lines"), "category": u.get("category")}
+            for u in units if isinstance(u, dict)
+        ]
+        return {
+            "finding_keys": keys,
+            "suggested_code": None,
+            "explanation": explanation,
+            "grounded_in": [],
+        }
+    except Exception as e:
+        logger.error("_failure_fix failed unexpectedly: %s", str(e))
+        return {"finding_keys": [], "suggested_code": None, "explanation": explanation, "grounded_in": []}
+
+
 async def run_optimizer(code: str, enriched_findings: list) -> dict:
     """
     Connects to MCP, routes findings, generates fixes, returns merged output.
@@ -533,114 +738,82 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
                 ]
                 logger.info("Connected to MCP. Tools: %s", ", ".join(tool_summary))
 
-                individual_findings, style_groups = _route_findings(enriched_findings)
+                # Explode repeats into single-line units, group overlapping units, then route:
+                # this is the conflict-resolution pass — overlapping findings share one call.
+                units            = _explode_repeats(enriched_findings)
+                groups           = _group_overlapping(units)
+                conflict_groups, individual_units, style_groups = _route_findings(groups)
 
-                total_calls = len(individual_findings) + sum(
-                    -(-len(v) // OPTIMIZER_STYLE_BATCH_SIZE)
-                    for v in style_groups.values()
+                total_calls = (
+                    len(conflict_groups)
+                    + len(individual_units)
+                    + sum(-(-len(v) // OPTIMIZER_STYLE_BATCH_SIZE) for v in style_groups.values())
                 )
                 logger.info(
-                    "Routing: %d individual call(s) + %d style group(s) → %d total call(s)",
-                    len(individual_findings), len(style_groups), total_calls,
+                    "Routing: %d conflict group(s) + %d individual + %d style group(s) → %d total call(s)",
+                    len(conflict_groups), len(individual_units), len(style_groups), total_calls,
                 )
 
                 all_fixes = []
                 failed_count = 0
 
-                # --- Individual findings ---
-                for i, finding in enumerate(individual_findings):
-                    logger.info(
-                        "Individual call %d/%d — rule %s line %d",
-                        i + 1, len(individual_findings),
-                        finding.get("rule"), finding.get("line"),
-                    )
-                    result = await run_optimizer_single(finding, code, session, all_tools)
+                # --- Conflict groups: overlapping units resolved by one merged fix per group ---
+                for i, group in enumerate(conflict_groups):
+                    logger.info("Conflict group %d/%d — %d unit(s)", i + 1, len(conflict_groups), len(group))
+                    result = await run_optimizer_group(group, code, session, all_tools)
+                    fixes  = result.get("fixes")
 
-                    if result.get("status") != "success":
-                        logger.error(
-                            "Individual call failed for rule %s line %s — skipping. Reason: %s",
-                            finding.get("rule"), finding.get("line"), result.get("message"),
-                        )
-                        all_fixes.append({
-                            "finding_rule": finding.get("rule"),
-                            "finding_line": finding.get("line"),
-                            "lines": finding.get("lines"),
-                            "category": finding.get("category"),
-                            "suggested_code": None,
-                            "explanation": f"Optimizer failed: {result.get('message', 'unknown error')}",
-                            "grounded_in": [],
-                        })
-                        failed_count += 1
+                    if result.get("status") != "success" or not isinstance(fixes, list):
+                        reason = result.get("message") or "optimizer returned no usable fixes list"
+                        logger.error("Conflict group %d failed — skipping. Reason: %s", i + 1, reason)
+                        all_fixes.append(_failure_fix(group, f"Optimizer failed: {reason}"))
+                        failed_count += len(group)
                         continue
 
-                    fixes = result.get("fixes")
-                    if not isinstance(fixes, list):     # internal contract violation — silently extending with a non-list would corrupt all_fixes
+                    all_fixes.extend(fixes)
+
+                # --- Individual units: one call each (Security / Logic / Maintainability) ---
+                for i, unit in enumerate(individual_units):
+                    logger.info(
+                        "Individual call %d/%d — rule %s lines %s",
+                        i + 1, len(individual_units), unit.get("rule"), unit.get("lines"),
+                    )
+                    result = await run_optimizer_single(unit, code, session, all_tools)
+                    fixes  = result.get("fixes")
+
+                    if result.get("status") != "success" or not isinstance(fixes, list):
+                        reason = result.get("message") or "optimizer returned no usable fixes list"
                         logger.error(
-                            "Individual call for rule %s returned malformed fixes — expected list, got %s",
-                            finding.get("rule"), type(fixes).__name__,
+                            "Individual call for rule %s lines %s failed — skipping. Reason: %s",
+                            unit.get("rule"), unit.get("lines"), reason,
                         )
-                        all_fixes.append({
-                            "finding_rule": finding.get("rule"),
-                            "finding_line": finding.get("line"),
-                            "lines": finding.get("lines"),
-                            "category": finding.get("category"),
-                            "suggested_code": None,
-                            "explanation": "Optimizer returned malformed output — no fixes list present.",
-                            "grounded_in": [],
-                        })
+                        all_fixes.append(_failure_fix([unit], f"Optimizer failed: {reason}"))
                         failed_count += 1
                         continue
 
                     all_fixes.extend(fixes)
 
-                # --- Style groups ---
-                for rule_code, group_findings in style_groups.items():
-                    chunks = chunk_list(group_findings, OPTIMIZER_STYLE_BATCH_SIZE)
+                # --- Style groups: same-rule units rule-batched (chunked) ---
+                for rule_code, group_units in style_groups.items():
+                    chunks = chunk_list(group_units, OPTIMIZER_STYLE_BATCH_SIZE)
                     logger.info(
-                        "Style group '%s': %d finding(s) → %d chunk(s)",
-                        rule_code, len(group_findings), len(chunks),
+                        "Style group '%s': %d unit(s) → %d chunk(s)",
+                        rule_code, len(group_units), len(chunks),
                     )
                     for j, chunk in enumerate(chunks):
                         logger.info(
-                            "Style group '%s' chunk %d/%d — %d finding(s)",
+                            "Style group '%s' chunk %d/%d — %d unit(s)",
                             rule_code, j + 1, len(chunks), len(chunk),
                         )
                         result = await run_optimizer_group(chunk, code, session, all_tools)
+                        fixes  = result.get("fixes")
 
-                        if result.get("status") != "success":
-                            logger.error(
-                                "Style group '%s' chunk %d failed — skipping. Reason: %s",
-                                rule_code, j + 1, result.get("message"),
-                            )
-                            for finding in chunk:
-                                all_fixes.append({
-                                    "finding_rule": finding.get("rule"),
-                                    "finding_line": finding.get("line"),
-                                    "lines": finding.get("lines"),
-                                    "category": finding.get("category"),
-                                    "suggested_code": None,
-                                    "explanation": f"Optimizer failed: {result.get('message', 'unknown error')}",
-                                    "grounded_in": [],
-                                })
-                            failed_count += len(chunk)
-                            continue
-
-                        fixes = result.get("fixes")
-                        if not isinstance(fixes, list):     # internal contract violation — silently extending with a non-list would corrupt all_fixes
-                            logger.error(
-                                "Style group '%s' chunk %d returned malformed fixes — expected list, got %s",
-                                rule_code, j + 1, type(fixes).__name__,
-                            )
-                            for finding in chunk:
-                                all_fixes.append({
-                                    "finding_rule": finding.get("rule"),
-                                    "finding_line": finding.get("line"),
-                                    "lines": finding.get("lines"),
-                                    "category": finding.get("category"),
-                                    "suggested_code": None,
-                                    "explanation": "Optimizer returned malformed output — no fixes list present.",
-                                    "grounded_in": [],
-                                })
+                        if result.get("status") != "success" or not isinstance(fixes, list):
+                            reason = result.get("message") or "optimizer returned no usable fixes list"
+                            logger.error("Style group '%s' chunk %d failed — skipping. Reason: %s", rule_code, j + 1, reason)
+                            # independent units — one failure entry each so each surfaces separately
+                            for u in chunk:
+                                all_fixes.append(_failure_fix([u], f"Optimizer failed: {reason}"))
                             failed_count += len(chunk)
                             continue
 
@@ -680,23 +853,55 @@ if __name__ == "__main__":
     from config import setup_logging
     setup_logging()
 
-    # Trailing whitespace deliberately placed on lines 2 and 4 so the W291 finding
-    # below carries a real multi-entry `lines` list — exercises the duplicate-line path.
+    # Findings mirror real Enricher output: every finding carries `lines` (a list) and
+    # `occurrences` — there is no `line` scalar. This input exercises the conflict path:
+    # line 1 holds three overlapping findings (E401 + two F401) that must collapse into one
+    # fix; line 4 holds two (B608 + W291); and W291 spans lines 2 and 4 with occurrences=2,
+    # so it is exploded into single-line units before grouping.
     test_code = (
-        "import os, sys\n"
-        "import json   \n"                                          # line 2: trailing whitespace
+        "import os, sys\n"                                           # line 1: E401 + F401(os) + F401(sys)
+        "import json   \n"                                           # line 2: trailing whitespace
         "def get_user(id):\n"
         "    query = 'SELECT * FROM users WHERE id = ' + id   \n"    # line 4: SQL injection + trailing whitespace
         "    return query\n"
     )
 
-    # Findings mirror real Enricher output: `lines` and `occurrences` are ALWAYS present,
-    # and `line` always equals `lines[0]`. The W291 finding spans two lines to prove the
-    # optimizer addresses every entry in `lines`, not just the first.
     test_findings = [
         {
+            "rule": "E401",
+            "lines": [1],
+            "occurrences": 1,
+            "category": "Style",
+            "severity": "LOW",
+            "rationale": "Multiple imports on one line should be split onto separate lines.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/multiple-imports-on-one-line",
+            "cwe_id": None,
+        },
+        {
+            "rule": "F401",
+            "lines": [1],
+            "occurrences": 1,
+            "category": "Logic",
+            "severity": "LOW",
+            "rationale": "'os' is imported but never used and should be removed.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/unused-import",
+            "cwe_id": None,
+        },
+        {
+            "rule": "F401",
+            "lines": [1],
+            "occurrences": 1,
+            "category": "Logic",
+            "severity": "LOW",
+            "rationale": "'sys' is imported but never used and should be removed.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/unused-import",
+            "cwe_id": None,
+        },
+        {
             "rule": "B608",
-            "line": 4,
             "lines": [4],
             "occurrences": 1,
             "category": "Security",
@@ -708,7 +913,6 @@ if __name__ == "__main__":
         },
         {
             "rule": "W291",
-            "line": 2,
             "lines": [2, 4],
             "occurrences": 2,
             "category": "Style",
