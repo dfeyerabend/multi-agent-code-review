@@ -31,40 +31,46 @@ def _derive_status(verdicts: dict) -> str:
     """
     Derives a deterministic status string from the three LLM verdicts.
 
-    Pipeline: called by run_evaluator once per pair after _run_evaluator_pair
-    returns successfully and all validation layers pass.
+    Pipeline: called by run_evaluator once per judged fix, after _run_evaluator_pair
+    returns successfully and all validation layers pass. NO_FIX (no suggestion) and
+    NOT_EVALUATED (evaluator failure) are set by run_evaluator's own paths, not here.
+
+    First-match-wins encodes the priority: a code problem outranks a guideline problem
+    (so an unfaithful-AND-broken fix reads as INCORRECT), and faithfulness only blocks
+    approval when a guideline actually existed — `not_applicable` (RAG found no
+    best_practice_refs) never demotes a correct fix.
 
     Args:
         verdicts: Dict with keys faithfulness, correctness, completeness.
 
     Returns:
-        One of: 'APPROVED', 'NEEDS_REVISION', 'UNRESOLVABLE'.
-        Returns 'UNRESOLVABLE' on bad input — a missing verdict is treated as
-        an unresolvable state rather than a silent guess.
+        One of: 'INCORRECT', 'INCOMPLETE', 'NONCOMPLIANT', 'APPROVED'.
+        Returns 'NOT_EVALUATED' on bad input or verdict values outside the known enums —
+        a missing/unknown verdict cannot be assumed to be passing.
     """
     if not isinstance(verdicts, dict):
-        logger.error(
-            "_derive_status: verdicts must be a dict, got %s",
-            type(verdicts).__name__,
-        )
-        return "UNRESOLVABLE"   # a missing or malformed verdict cannot be assumed to be passing
+        logger.error("_derive_status: verdicts must be a dict, got %s", type(verdicts).__name__)
+        return "NOT_EVALUATED"   # a missing or malformed verdict cannot be assumed to be passing
 
     try:
-        if verdicts.get("correctness") == "fail":   # broken code overrides everything — no other verdict can salvage it
-            return "UNRESOLVABLE"
+        correctness  = verdicts.get("correctness")
+        completeness = verdicts.get("completeness")
+        faithfulness = verdicts.get("faithfulness")
 
-        if (
-            verdicts.get("faithfulness") == "faithful"
-            and verdicts.get("correctness") == "pass"
-            and verdicts.get("completeness") == "complete"
-        ):
-            return "APPROVED"
+        if correctness == "fail":            # broken code outranks everything — faithfulness is irrelevant
+            return "INCORRECT"
+        if completeness != "complete":       # valid but partial — a code-level problem, ranks above guidelines
+            return "INCOMPLETE"
+        if faithfulness == "unfaithful":      # correct + complete but deviates from a retrieved guideline
+            return "NONCOMPLIANT"
+        if correctness == "pass" and faithfulness in ("faithful", "not_applicable"):
+            return "APPROVED"                 # correct, complete, and either faithful or no guideline existed
 
-        return "NEEDS_REVISION"
+        return "NOT_EVALUATED"               # verdict values outside the known enums — never silently approve
 
     except Exception as e:
         logger.error("_derive_status failed unexpectedly: %s", str(e))
-        return "UNRESOLVABLE"
+        return "NOT_EVALUATED"
 
 async def _run_evaluator_pair(code: str, issue: dict, fix: dict) -> dict:
     """
@@ -227,7 +233,7 @@ def _evaluated_entry(
         rule:           Rule code of the covered finding.
         lines:          Line number(s) the finding affects.
         category:       Finding category, for the report matrix.
-        status:         Derived status — APPROVED / NEEDS_REVISION / UNRESOLVABLE.
+        status:         Derived status — APPROVED / INCORRECT / INCOMPLETE / NONCOMPLIANT / NO_FIX / NOT_EVALUATED.
         suggested_code: The optimizer's fix, or None.
         grounded_in:    Grounding sources from the optimizer.
         reasoning:      Human-readable verdict reasoning.
@@ -254,7 +260,7 @@ def _evaluated_entry(
     except Exception as e:
         logger.error("_evaluated_entry failed unexpectedly: %s", str(e))
         return {
-            "rule": str(rule), "lines": lines, "category": "Unknown", "status": "UNRESOLVABLE",
+            "rule": str(rule), "lines": lines, "category": "Unknown", "status": "NOT_EVALUATED",
             "suggested_code": None, "grounded_in": [], "reasoning": f"Entry construction failed: {str(e)}",
             "faithfulness": None, "correctness": None, "completeness": None,
         }
@@ -264,10 +270,10 @@ def _entries_for_fix(fix: dict, status: str, reasoning: str, verdicts: dict = No
     """
     Fans one judged fix out to one evaluated entry per finding it covers.
 
-    Pipeline: called by run_evaluator (this module) after a fix is judged, or determined
-    UNRESOLVABLE without an LLM call. The single verdict is shared across every finding in
-    the fix's finding_keys, so a fix that resolved three conflicting findings produces three
-    report entries that all carry the same status and reasoning.
+    Pipeline: called by run_evaluator (this module) after a fix is judged, or assigned a
+    no-fix / failure status without an LLM call. The single verdict is shared across every
+    finding in the fix's finding_keys, so a fix that resolved three conflicting findings
+    produces three report entries that all carry the same status and reasoning.
 
     Args:
         fix:       Optimizer fix dict with finding_keys, suggested_code, grounded_in.
@@ -278,11 +284,11 @@ def _entries_for_fix(fix: dict, status: str, reasoning: str, verdicts: dict = No
 
     Returns:
         List of fixes_evaluated entries, one per finding_key. A fix with no usable
-        finding_keys still yields one degraded UNRESOLVABLE entry so it never vanishes.
+        finding_keys still yields one degraded NOT_EVALUATED entry so it never vanishes.
     """
     if not isinstance(fix, dict):
         logger.error("_entries_for_fix: fix must be a dict, got %s", type(fix).__name__)
-        return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", None, [],
+        return [_evaluated_entry(None, None, "Unknown", "NOT_EVALUATED", None, [],
                                  "Fix was not a dict — cannot evaluate.", None, None, None)]
 
     try:
@@ -298,7 +304,7 @@ def _entries_for_fix(fix: dict, status: str, reasoning: str, verdicts: dict = No
         # A fix with no identity still must surface once, attributed to nothing, rather than vanish.
         if not isinstance(finding_keys, list) or not finding_keys:
             logger.error("_entries_for_fix: fix has no usable finding_keys — emitting one degraded entry")
-            return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", suggested_code, grounded_in,
+            return [_evaluated_entry(None, None, "Unknown", "NOT_EVALUATED", suggested_code, grounded_in,
                                      "Fix carried no finding identity — cannot attribute to a finding.",
                                      None, None, None)]
 
@@ -321,7 +327,7 @@ def _entries_for_fix(fix: dict, status: str, reasoning: str, verdicts: dict = No
             ))
 
         if not entries:  # every key was malformed — still surface the fix once
-            return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", suggested_code, grounded_in,
+            return [_evaluated_entry(None, None, "Unknown", "NOT_EVALUATED", suggested_code, grounded_in,
                                      "Fix finding_keys were all malformed — cannot attribute to a finding.",
                                      None, None, None)]
 
@@ -329,7 +335,7 @@ def _entries_for_fix(fix: dict, status: str, reasoning: str, verdicts: dict = No
 
     except Exception as e:
         logger.error("_entries_for_fix failed unexpectedly: %s", str(e))
-        return [_evaluated_entry(None, None, "Unknown", "UNRESOLVABLE", None, [],
+        return [_evaluated_entry(None, None, "Unknown", "NOT_EVALUATED", None, [],
                                  f"Entry fan-out failed: {str(e)}", None, None, None)]
 
 # === AGENT LOOP ===
@@ -440,7 +446,8 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
                 "report": "",
                 "summary": "No findings to evaluate.",
             },
-            "metadata": {"total": 0, "approved": 0, "needs_revision": 0, "unresolvable": 0},
+            "metadata": {"total": 0, "approved": 0, "incorrect": 0, "incomplete": 0,
+                         "noncompliant": 0, "no_fix": 0, "not_evaluated": 0},
         }
 
     try:
@@ -451,8 +458,8 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
         # every finding it covers reconstructs the full per-finding report without re-matching.
         for i, fix in enumerate(fixes):
             if not isinstance(fix, dict):  # a non-dict fix cannot be judged — surface it, do not crash the loop
-                logger.warning("run_evaluator: fixes[%d] is not a dict (%s) — marking UNRESOLVABLE", i, type(fix).__name__)
-                fixes_evaluated.extend(_entries_for_fix(fix, "UNRESOLVABLE", "Optimizer fix entry was malformed."))
+                logger.warning("run_evaluator: fixes[%d] is not a dict (%s) — marking NOT_EVALUATED", i, type(fix).__name__)
+                fixes_evaluated.extend(_entries_for_fix(fix, "NOT_EVALUATED", "Optimizer fix entry was malformed."))
                 continue
 
             suggested_code = fix.get("suggested_code")
@@ -460,8 +467,8 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
             # No suggested code → optimizer produced no actionable fix; nothing to judge.
             if suggested_code is None:
                 reason = fix.get("explanation") or "No fix was produced for this finding."
-                logger.warning("run_evaluator: fixes[%d] has null suggested_code — UNRESOLVABLE without LLM call", i)
-                fixes_evaluated.extend(_entries_for_fix(fix, "UNRESOLVABLE", reason))
+                logger.warning("run_evaluator: fixes[%d] has null suggested_code — NO_FIX without LLM call", i)
+                fixes_evaluated.extend(_entries_for_fix(fix, "NO_FIX", reason))
                 continue
 
             # Minimal LLM input: issue context recovered from the findings plus the fix's own
@@ -481,9 +488,9 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
 
             # Layer 1a: agent ran out of iterations — predictable budget failure, not a bug.
             if result.get("status") == "max_iterations_reached":
-                logger.warning("run_evaluator: fixes[%d] hit max iterations — marking UNRESOLVABLE", i)
+                logger.warning("run_evaluator: fixes[%d] hit max iterations — marking NOT_EVALUATED", i)
                 fixes_evaluated.extend(_entries_for_fix(
-                    fix, "UNRESOLVABLE",
+                    fix, "NOT_EVALUATED",
                     "Evaluator reached max iterations without producing a valid verdict.",
                 ))
                 continue
@@ -492,7 +499,7 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
             if result.get("status") == "error":
                 logger.error("run_evaluator: fixes[%d] errored: %s", i, result.get("message", "unknown error"))
                 fixes_evaluated.extend(_entries_for_fix(
-                    fix, "UNRESOLVABLE",
+                    fix, "NOT_EVALUATED",
                     f"Unexpected error during evaluation: {result.get('message', 'unknown error')}",
                 ))
                 continue
@@ -503,7 +510,7 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
             if not isinstance(evaluation, dict):
                 logger.error("run_evaluator: fixes[%d] — no 'evaluation' dict (got %s)", i, type(evaluation).__name__)
                 fixes_evaluated.extend(_entries_for_fix(
-                    fix, "UNRESOLVABLE", "Evaluator returned malformed output — no evaluation dict present.",
+                    fix, "NOT_EVALUATED", "Evaluator returned malformed output — no evaluation dict present.",
                 ))
                 continue
 
@@ -512,7 +519,7 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
             if missing:
                 logger.error("run_evaluator: fixes[%d] — evaluation missing fields %s", i, missing)
                 fixes_evaluated.extend(_entries_for_fix(
-                    fix, "UNRESOLVABLE", f"Evaluator returned incomplete verdicts — missing: {missing}",
+                    fix, "NOT_EVALUATED", f"Evaluator returned incomplete verdicts — missing: {missing}",
                 ))
                 continue
 
@@ -524,16 +531,19 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
             # One verdict, fanned out to every finding this fix resolved.
             fixes_evaluated.extend(_entries_for_fix(fix, status, evaluation["reasoning"], evaluation))
 
-        open_findings  = [e for e in fixes_evaluated if e["status"] == "UNRESOLVABLE"]
-        approved       = sum(1 for e in fixes_evaluated if e["status"] == "APPROVED")
-        needs_revision = sum(1 for e in fixes_evaluated if e["status"] == "NEEDS_REVISION")
-        unresolvable   = len(open_findings)
-        total          = len(fixes_evaluated)
+        # Per-status tally; open_findings is everything that still needs the user's attention (not APPROVED).
+        status_counts = {}
+        for e in fixes_evaluated:
+            s = e.get("status", "NOT_EVALUATED")
+            status_counts[s] = status_counts.get(s, 0) + 1
 
-        summary = (
-            f"{total} finding(s) evaluated: {approved} approved, "
-            f"{needs_revision} need revision, {unresolvable} unresolvable."
-        )
+        total         = len(fixes_evaluated)
+        approved      = status_counts.get("APPROVED", 0)
+        open_findings = [e for e in fixes_evaluated if e.get("status") != "APPROVED"]
+
+        ordered = ["APPROVED", "INCORRECT", "INCOMPLETE", "NONCOMPLIANT", "NO_FIX", "NOT_EVALUATED"]
+        parts   = [f"{status_counts[s]} {s.lower()}" for s in ordered if status_counts.get(s)]
+        summary = f"{total} finding(s) evaluated: " + ", ".join(parts) + "."
 
         # Call create_review_report via MCP — once, after all pairs are processed
         report = ""
@@ -569,10 +579,13 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
                 "summary":         summary,
             },
             "metadata": {
-                "total":          total,
-                "approved":       approved,
-                "needs_revision": needs_revision,
-                "unresolvable":   unresolvable,
+                "total":         total,
+                "approved":      approved,
+                "incorrect":     status_counts.get("INCORRECT", 0),
+                "incomplete":    status_counts.get("INCOMPLETE", 0),
+                "noncompliant":  status_counts.get("NONCOMPLIANT", 0),
+                "no_fix":        status_counts.get("NO_FIX", 0),
+                "not_evaluated": status_counts.get("NOT_EVALUATED", 0),
             },
         }
 
@@ -594,12 +607,18 @@ if __name__ == "__main__":
         "def get_user(id):\n"
         "    query = 'SELECT * FROM users WHERE id = ' + id\n"
         "    return query\n"
+        "def list_users():\n"
+        "    pass\n"
+        "def fetch_data(user_id):\n"
+        "    return 'SELECT * FROM data WHERE id = ' + user_id\n"
     )
 
     # Findings carry `lines` only (no `line`). _issue_for_fix recovers each fix's rationale
     # from here by matching rule + overlapping lines.
     test_enriched_findings = [
         {
+            # No best_practice_refs → its fix below should land faithfulness=not_applicable → APPROVED.
+            # This is the regression case for the false-"unfaithful" bug the redesign fixes.
             "rule": "E401",
             "lines": [1],
             "category": "Style",
@@ -609,6 +628,7 @@ if __name__ == "__main__":
             "doc_url": "https://docs.astral.sh/ruff/rules/multiple-imports-on-one-line",
         },
         {
+            # Same conflict group as E401 (both on line 1) — no refs either, same not_applicable check.
             "rule": "F401",
             "lines": [1],
             "category": "Logic",
@@ -618,6 +638,8 @@ if __name__ == "__main__":
             "doc_url": "https://docs.astral.sh/ruff/rules/unused-import",
         },
         {
+            # Has a real, applicable best_practice_ref. Its fix below follows it →
+            # faithfulness=faithful → APPROVED. Proves the genuine-faithful path still works.
             "rule": "B608",
             "lines": [3],
             "category": "Security",
@@ -633,6 +655,7 @@ if __name__ == "__main__":
             "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",
         },
         {
+            # No fix produced for this one (see test_fixes) → NO_FIX, no LLM call made.
             "rule": "W291",
             "lines": [1],
             "category": "Style",
@@ -641,22 +664,84 @@ if __name__ == "__main__":
             "best_practice_refs": [],
             "doc_url": "https://docs.astral.sh/ruff/rules/trailing-whitespace",
         },
+        {
+            # Has a real, applicable ref that its fix below deliberately ignores →
+            # faithfulness=unfaithful → NONCOMPLIANT (correct code, wrong guideline adherence).
+            "rule": "C901",
+            "lines": [5],
+            "category": "Maintainability",
+            "severity": "LOW",
+            "rationale": "Function should have a docstring explaining its purpose.",
+            "best_practice_refs": [
+                {
+                    "source": "pyguide",
+                    "section": "3.8.1",
+                    "text": "Every public function must have a docstring.",
+                }
+            ],
+            "doc_url": "https://google.github.io/styleguide/pyguide.html",
+        },
+        {
+            # Its fix below only renames the function without adding the required docstring →
+            # correctness=pass but completeness=incomplete → INCOMPLETE (a code-level problem).
+            "rule": "D103",
+            "lines": [5],
+            "category": "Maintainability",
+            "severity": "LOW",
+            "rationale": "Public function 'list_users' is missing a docstring.",
+            "best_practice_refs": [],
+            "doc_url": "https://docs.astral.sh/ruff/rules/undocumented-public-function",
+        },
+        {
+            # rationale covers ONLY the SQL-injection bug; best_practice_refs additionally
+            # carries the company db_-prefix naming rule (plausible: RAG retrieved a broader
+            # company-rules chunk than the rationale literally states). The fix below fully
+            # resolves the injection (correctness=pass, completeness=complete — no escape
+            # hatch via "incomplete") but keeps the violating function name, so it should
+            # score faithfulness=unfaithful against §1.1 → NONCOMPLIANT, unambiguously.
+            "rule": "B608",
+            "lines": [8],
+            "category": "Security",
+            "severity": "HIGH",
+            "rationale": "String-based SQL query construction in a database-access function allows injection attacks.",
+            "best_practice_refs": [
+                {
+                    "source": "company_rules",
+                    "section": "1.1",
+                    "text": (
+                        "All functions that interact with a database must be prefixed with "
+                        "db_fetch_, db_save_, or db_delete_ depending on their operation."
+                    ),
+                },
+                {
+                    "source": "company_rules",
+                    "section": "1.3",
+                    "text": "Never construct SQL queries via string concatenation.",
+                },
+            ],
+            "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",
+        },
     ]
 
     # Fixes mirror real Optimizer output: each carries finding_keys plus the model's own
-    # output. Three shapes are exercised: a multi-finding fix (fans out to two report
-    # entries), a single-finding fix, and a null fix (UNRESOLVABLE without an LLM call).
+    # output. Exercises every status: a multi-finding fix with no refs (not_applicable →
+    # APPROVED), a faithful fix (faithful → APPROVED), a fix that ignores an applicable ref
+    # (unfaithful → NONCOMPLIANT), a fix that doesn't finish the job (→ INCOMPLETE), and a
+    # null fix (NO_FIX, no LLM call).
     test_fixes = [
         {
+            # Covers E401 + F401 (line 1). grounded_in is empty — nothing to (dis)honestly cite,
+            # and best_practice_refs was empty too, so this should score not_applicable.
             "finding_keys": [
                 {"rule": "E401", "lines": [1], "category": "Style"},
                 {"rule": "F401", "lines": [1], "category": "Logic"},
             ],
             "suggested_code": "import sys\n",
             "explanation": "Removed the unused 'os' import and split the combined import line.",
-            "grounded_in": ["pyguide §2.1"],
+            "grounded_in": [],
         },
         {
+            # Covers B608 (line 3). Follows the cited company_rules ref → faithful.
             "finding_keys": [
                 {"rule": "B608", "lines": [3], "category": "Security"},
             ],
@@ -669,12 +754,56 @@ if __name__ == "__main__":
             "grounded_in": ["company_rules §1.3"],
         },
         {
+            # Covers W291 (line 1). Optimizer produced nothing → NO_FIX, no LLM call.
             "finding_keys": [
                 {"rule": "W291", "lines": [1], "category": "Style"},
             ],
             "suggested_code": None,
             "explanation": "Optimizer did not return a fix for this finding.",
             "grounded_in": [],
+        },
+        {
+            # Covers C901 (line 5). A no-op that adds no docstring at all — the code does
+            # nothing toward resolving the issue, so a strict judge may call this
+            # correctness=fail → INCORRECT rather than NONCOMPLIANT (observed in practice:
+            # the model judged INCORRECT here, since there's no work done to assess
+            # faithfulness against). Kept as a deliberately ambiguous no-op case; see the
+            # B608/db_-prefix fix below for the unambiguous NONCOMPLIANT case.
+            "finding_keys": [
+                {"rule": "C901", "lines": [5], "category": "Maintainability"},
+            ],
+            "suggested_code": "def list_users():\n    pass\n",
+            "explanation": "Renamed for clarity; behavior unchanged.",
+            "grounded_in": ["pyguide §3.8.1"],
+        },
+        {
+            # Covers D103 (line 5). Same code as above: still no docstring, so the core of
+            # the issue (missing docstring) is unaddressed — correctness=pass but
+            # completeness should score incomplete → INCOMPLETE.
+            "finding_keys": [
+                {"rule": "D103", "lines": [5], "category": "Maintainability"},
+            ],
+            "suggested_code": "def list_users():\n    pass\n",
+            "explanation": "No-op placeholder; docstring not added.",
+            "grounded_in": [],
+        },
+        {
+            # Covers B608 (line 8). Fully fixes the injection (correctness=pass,
+            # completeness=complete — nothing left to call "incomplete"), but keeps the
+            # function named `fetch_data` instead of the required `db_fetch_` prefix from
+            # §1.1, which IS in best_practice_refs. grounded_in only cites §1.3 (the rule it
+            # followed) — no dishonest citation, just a guideline it silently ignored. This
+            # is the unambiguous correct-but-noncompliant case: should score
+            # faithfulness=unfaithful → NONCOMPLIANT.
+            "finding_keys": [
+                {"rule": "B608", "lines": [8], "category": "Security"},
+            ],
+            "suggested_code": (
+                "def fetch_data(user_id):\n"
+                "    return db.execute('SELECT * FROM data WHERE id = %s', (user_id,))\n"
+            ),
+            "explanation": "Replaced string concatenation with a parameterized query to prevent SQL injection.",
+            "grounded_in": ["company_rules §1.3"],
         },
     ]
 

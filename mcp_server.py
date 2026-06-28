@@ -748,11 +748,22 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
         }, indent=2)
 
     try:
-        status_emoji = {"APPROVED": "✅", "NEEDS_REVISION": "⚠️", "UNRESOLVABLE": "❌"}
+        # (status, emoji, label) in report priority order — drives both the emoji lookup and the matrix.
+        status_meta = [
+            ("APPROVED",      "✅", "Approved"),
+            ("INCORRECT",     "❌", "Incorrect"),
+            ("INCOMPLETE",    "⚠️", "Incomplete"),
+            ("NONCOMPLIANT",  "📏", "Noncompliant"),
+            ("NO_FIX",        "🚫", "No fix"),
+            ("NOT_EVALUATED", "❓", "Not evaluated"),
+        ]
+        status_emoji = {s: e for s, e, _ in status_meta}
 
-        approved       = [f for f in fixes_evaluated if f.get("status") == "APPROVED"]
-        needs_revision = [f for f in fixes_evaluated if f.get("status") == "NEEDS_REVISION"]
-        unresolvable   = [f for f in fixes_evaluated if f.get("status") == "UNRESOLVABLE"]
+        counts = {s: 0 for s, _, _ in status_meta}
+        for f in fixes_evaluated:
+            st = f.get("status") if isinstance(f, dict) else None
+            if st in counts:
+                counts[st] += 1
 
         lines = [
             "# Code Review Report",
@@ -761,13 +772,9 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
             "",
             "| Status | Count |",
             "|--------|-------|",
-            f"| ✅ Approved       | {len(approved)} |",
-            f"| ⚠️ Needs Revision | {len(needs_revision)} |",
-            f"| ❌ Unresolvable   | {len(unresolvable)} |",
-            "",
-            "---",
-            "",
         ]
+        lines += [f"| {emoji} {label} | {counts[st]} |" for st, emoji, label in status_meta]
+        lines += ["", "---", ""]
 
         for i, fix in enumerate(fixes_evaluated):
             if not isinstance(fix, dict):
@@ -799,6 +806,16 @@ def create_review_report(fixes_evaluated: list, summary: str) -> str:
                 f"**Reasoning:** {reasoning}",
                 "",
             ]
+
+            # Secondary guideline line: visible but below the reasoning. Skipped when no verdict
+            # was made (NO_FIX / NOT_EVALUATED have faithfulness=None).
+            faith_label = {
+                "faithful":       "faithful to the cited guideline",
+                "unfaithful":     "deviates from a retrieved guideline",
+                "not_applicable": "no matching guideline in the knowledge base",
+            }.get(fix.get("faithfulness"))
+            if faith_label:
+                lines += [f"**Guideline adherence:** {faith_label}", ""]
 
             if grounded_in:
                 lines += [

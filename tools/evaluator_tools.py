@@ -8,7 +8,7 @@ import json
 
 # === ALLOWED VERDICT VALUES ===
 
-_FAITHFULNESS = ["faithful", "partial", "unfaithful"]
+_FAITHFULNESS = ["faithful", "unfaithful", "not_applicable"]  # not_applicable: no best_practice_refs to judge against
 _CORRECTNESS  = ["pass", "fail"]
 _COMPLETENESS = ["complete", "partial", "incomplete"]
 
@@ -28,27 +28,35 @@ evaluator_local_tools = [
                 "reasoning": {                              # first: model argues before it judges
                     "type": "string",
                     "description": (
-                        "Reason through the fix here first: how it relates to the code and the "
-                        "referenced best practice. Write this before deciding the three verdicts."
+                        "Reason through the fix before deciding the verdicts, in two blocks separated by "
+                        "a blank line. First block: objective quality — is the code correct, and does it "
+                        "fully resolve the issue? Second block: faithfulness — briefly, is it faithful to "
+                        "best_practice_refs; if it deviates, name where and a likely why; if there are no "
+                        "refs, say there was no guideline to follow."
                     ),
                 },
-                "faithfulness": {
-                    "type": "string",
-                    "enum": _FAITHFULNESS,
-                    "description": "Does the fix follow best_practice_refs and cite them honestly in grounded_in?",
-                },
-                "correctness": {
+                "correctness": {                            # judged before faithfulness: schema order drives reasoning order
                     "type": "string",
                     "enum": _CORRECTNESS,
-                    "description": "Is suggested_code valid Python that resolves the issue in rationale?",
+                    "description": "Is suggested_code valid Python that resolves the issue in rationale? Judge this first.",
                 },
                 "completeness": {
                     "type": "string",
                     "enum": _COMPLETENESS,
                     "description": "Does the fix resolve the whole issue, not just part of it?",
                 },
+                "faithfulness": {
+                    "type": "string",
+                    "enum": _FAITHFULNESS,
+                    "description": (
+                        "Judged ONLY against best_practice_refs: 'faithful' if the fix follows them, "
+                        "'unfaithful' if a ref exists but the fix deviates from it, 'not_applicable' if "
+                        "best_practice_refs is empty (no guideline to follow). A doc_url citation in "
+                        "grounded_in is not itself a violation."
+                    ),
+                },
             },
-            "required": ["reasoning", "faithfulness", "correctness", "completeness"],
+            "required": ["reasoning", "correctness", "completeness", "faithfulness"],
         },
     }
 ]
@@ -71,7 +79,7 @@ def run_evaluator_tool(name: str, tool_input: dict) -> str:
 
     # Catch incorrect calls from LLM early
     try:
-        required = ["reasoning", "faithfulness", "correctness", "completeness"]
+        required = ["reasoning", "correctness", "completeness", "faithfulness"]
         missing = [f for f in required if f not in tool_input]
         if missing:
             return json.dumps({
@@ -87,9 +95,9 @@ def run_evaluator_tool(name: str, tool_input: dict) -> str:
 
         # Check if LLM used the correct scoring schema
         enums = {
-            "faithfulness": _FAITHFULNESS,
             "correctness":  _CORRECTNESS,
             "completeness": _COMPLETENESS,
+            "faithfulness": _FAITHFULNESS,
         }
         for field, allowed in enums.items():               # defensive re-check beyond the API schema
             value = tool_input[field]
@@ -103,9 +111,9 @@ def run_evaluator_tool(name: str, tool_input: dict) -> str:
             "status": "success",
             "evaluation": {
                 "reasoning":    tool_input["reasoning"],
-                "faithfulness": tool_input["faithfulness"],
                 "correctness":  tool_input["correctness"],
                 "completeness": tool_input["completeness"],
+                "faithfulness": tool_input["faithfulness"],
             },
         }, indent=2)
 

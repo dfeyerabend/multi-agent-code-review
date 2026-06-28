@@ -81,6 +81,24 @@ def test_submit_evaluation_invalid_faithfulness():
     assert "faithfulness" in result["message"]
 
 
+def test_submit_evaluation_rejects_dropped_partial_faithfulness():
+    """'partial' was removed from the faithfulness enum (replaced by not_applicable) — must be rejected."""
+    bad_input = {**_VALID_INPUT, "faithfulness": "partial"}
+    result = json.loads(run_evaluator_tool("submit_evaluation", bad_input))
+
+    assert result["status"] == "error"
+    assert "faithfulness" in result["message"]
+
+
+def test_submit_evaluation_not_applicable_faithfulness_is_valid():
+    """not_applicable is a valid faithfulness value — no best_practice_refs to judge against."""
+    ok_input = {**_VALID_INPUT, "faithfulness": "not_applicable"}
+    result = json.loads(run_evaluator_tool("submit_evaluation", ok_input))
+
+    assert result["status"] == "success"
+    assert result["evaluation"]["faithfulness"] == "not_applicable"
+
+
 def test_submit_evaluation_invalid_correctness():
     """Returns error naming the field and the bad value when correctness is out of enum."""
     bad_input = {**_VALID_INPUT, "correctness": "maybe"}
@@ -126,7 +144,7 @@ def test_evaluated_entry_has_full_schema():
 
 def test_evaluated_entry_coerces_non_string_rule():
     """A non-string rule is coerced, not dropped — losing the id is worse than a dirty string."""
-    entry = _evaluated_entry(None, [1], "Style", "UNRESOLVABLE", None, [], "r", None, None, None)
+    entry = _evaluated_entry(None, [1], "Style", "NOT_EVALUATED", None, [], "r", None, None, None)
 
     assert isinstance(entry["rule"], str)
     assert entry["rule"] == "None"
@@ -168,22 +186,22 @@ def test_entries_for_fix_null_verdicts_when_no_llm():
     """With no verdicts dict (no LLM call), the three verdict fields are None."""
     fix = {"finding_keys": [{"rule": "W291", "lines": [1], "category": "Style"}],
            "suggested_code": None, "grounded_in": []}
-    entries = _entries_for_fix(fix, "UNRESOLVABLE", "no fix produced")
+    entries = _entries_for_fix(fix, "NO_FIX", "no fix produced")
 
     assert len(entries) == 1
-    assert entries[0]["status"] == "UNRESOLVABLE"
+    assert entries[0]["status"] == "NO_FIX"
     assert entries[0]["faithfulness"] is None
     assert entries[0]["correctness"] is None
     assert entries[0]["completeness"] is None
 
 
 def test_entries_for_fix_missing_finding_keys_still_surfaces():
-    """A fix with no finding_keys still yields one degraded UNRESOLVABLE entry, never vanishes."""
+    """A fix with no finding_keys still yields one degraded NOT_EVALUATED entry, never vanishes."""
     fix = {"suggested_code": "x", "grounded_in": []}
     entries = _entries_for_fix(fix, "APPROVED", "r", _VERDICTS)
 
     assert len(entries) == 1
-    assert entries[0]["status"] == "UNRESOLVABLE"
+    assert entries[0]["status"] == "NOT_EVALUATED"
 
 
 def test_entries_for_fix_non_dict_fix_surfaces_once():
@@ -191,7 +209,7 @@ def test_entries_for_fix_non_dict_fix_surfaces_once():
     entries = _entries_for_fix("nope", "APPROVED", "r")
 
     assert len(entries) == 1
-    assert entries[0]["status"] == "UNRESOLVABLE"
+    assert entries[0]["status"] == "NOT_EVALUATED"
 
 
 def test_entries_for_fix_skips_non_dict_key():
@@ -246,21 +264,36 @@ def test_issue_for_fix_non_dict_fix_returns_empty():
 
 # === _derive_status (evaluator_agent.py) ===
 
-def test_derive_status_approved():
-    """All three verdicts passing → APPROVED."""
+def test_derive_status_approved_when_faithful():
+    """Correct, complete, and faithful to a retrieved guideline → APPROVED."""
     assert _derive_status({"faithfulness": "faithful", "correctness": "pass", "completeness": "complete"}) == "APPROVED"
 
 
-def test_derive_status_correctness_fail_is_unresolvable():
-    """Broken code overrides everything → UNRESOLVABLE."""
-    assert _derive_status({"faithfulness": "faithful", "correctness": "fail", "completeness": "complete"}) == "UNRESOLVABLE"
+def test_derive_status_approved_when_no_guideline():
+    """Correct, complete, and not_applicable (no guideline existed) → APPROVED — never blocked by faithfulness."""
+    assert _derive_status({"faithfulness": "not_applicable", "correctness": "pass", "completeness": "complete"}) == "APPROVED"
 
 
-def test_derive_status_partial_is_needs_revision():
-    """Any non-failing-but-imperfect mix → NEEDS_REVISION."""
-    assert _derive_status({"faithfulness": "unfaithful", "correctness": "pass", "completeness": "complete"}) == "NEEDS_REVISION"
+def test_derive_status_correctness_fail_is_incorrect():
+    """Broken/wrong code outranks everything, including faithfulness → INCORRECT."""
+    assert _derive_status({"faithfulness": "faithful", "correctness": "fail", "completeness": "complete"}) == "INCORRECT"
 
 
-def test_derive_status_non_dict_is_unresolvable():
-    """A malformed verdicts input is treated as UNRESOLVABLE, never raises."""
-    assert _derive_status("nope") == "UNRESOLVABLE"
+def test_derive_status_incomplete_outranks_faithfulness():
+    """Correct but only partially resolves the issue → INCOMPLETE, even if it would otherwise be faithful."""
+    assert _derive_status({"faithfulness": "faithful", "correctness": "pass", "completeness": "partial"}) == "INCOMPLETE"
+
+
+def test_derive_status_unfaithful_is_noncompliant():
+    """Correct and complete, but deviates from a retrieved guideline → NONCOMPLIANT."""
+    assert _derive_status({"faithfulness": "unfaithful", "correctness": "pass", "completeness": "complete"}) == "NONCOMPLIANT"
+
+
+def test_derive_status_unknown_verdict_value_is_not_evaluated():
+    """A verdict value outside the known enums is never silently approved → NOT_EVALUATED."""
+    assert _derive_status({"faithfulness": "??", "correctness": "pass", "completeness": "complete"}) == "NOT_EVALUATED"
+
+
+def test_derive_status_non_dict_is_not_evaluated():
+    """A malformed verdicts input is treated as NOT_EVALUATED, never raises."""
+    assert _derive_status("nope") == "NOT_EVALUATED"
