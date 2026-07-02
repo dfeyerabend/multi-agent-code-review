@@ -76,7 +76,6 @@ A single MCP server (`code-review-mcp`) exposes all tools. Agents discover tools
 | `extract_code_structure`    | Extract functions, classes, imports | `ast.parse()` + `ast.walk()` |
 | `knowledge_search`          | RAG search for best-practice context | ChromaDB cosine similarity, metadata category filter |
 | `generate_fix_suggestion`   | Extract enclosing function source for a finding line | AST walk, falls back to surrounding lines on syntax error or module-level code |
-| `create_review_report`      | Format evaluated fixes into a markdown report | Builds category × status table + per-fix sections |
 
 ### Agent Design
 
@@ -135,7 +134,7 @@ Status is derived deterministically in Python from the three verdicts — not by
 | `NO_FIX` | Optimizer produced no fix for this finding |
 | `NOT_EVALUATED` | Evaluator hit max iterations or returned malformed output |
 
-`create_review_report` formats the results into a markdown report with a category × status overview table.
+The orchestrator's `render_report` layer (`render_report.py`) formats the results into a markdown report — a status-count overview table plus one block per fix (findings, original vs suggested code, verdicts, reasoning). The same functions back both the console output and a future Gradio UI.
 ---
 
 ## Project Structure
@@ -171,7 +170,9 @@ multi-agent-code-review/
 │ └── test_evaluator_tools.py       # submit_evaluation schema validation tests
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
-├── orchestrator.py                 # Pipeline driver — Analyzer → Enricher → Optimizer → Evaluator
+├── orchestrator.py                 # Pipeline driver + owns all user-facing output
+├── render_report.py                # Rendering layer: pipeline results → Markdown (console + Gradio)
+├── reports/                        # Generated review reports (gitignored)
 ├── requirements.txt
 ├── .env
 └── .gitignore

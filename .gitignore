@@ -13,6 +13,9 @@ knowledge_base/chroma_db/
 # Not published files
 hidden/
 
+# reports
+reports/
+
 # Models
 *.safetensors
 *.bin
@@ -26,9 +29,6 @@ my_model/
 # OS
 .DS_Store
 Thumbs.db
-
-# wandb
-wandb/
 
 # Ignore certificates
 *.pem

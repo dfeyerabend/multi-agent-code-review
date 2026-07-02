@@ -1,12 +1,13 @@
 """
 Evaluator Agent — Step 4 in the Code Review Pipeline.
-Receives enriched findings and optimizer fixes from the orchestrator, judges each (finding, fix) pair independently, and returns a structured evaluation with a markdown report.
+Receives enriched findings and optimizer fixes from the orchestrator, judges each fix
+independently, and returns a structured evaluation. No MCP: the agent loop uses only the
+local submit_evaluation tool, and the final report is rendered by the orchestrator's
+render_report layer, not here.
 """
 
 import asyncio
 import json
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
 import logging
 logger = logging.getLogger(__name__)
@@ -16,7 +17,6 @@ from config import (
     MODEL,
     MAX_TOKENS,
     MAX_ITERATIONS,
-    MCP_SERVER_PATH,
     EVALUATOR_PROMPT,
 )
 
@@ -239,7 +239,7 @@ def _evaluated_entry(
     Builds one fixes_evaluated entry with the full report schema.
 
     Pipeline: called by _entries_for_fix (this module) for every covered finding key, so
-    every entry create_review_report renders carries an identical set of keys — a missing
+    every entry the render_report layer consumes carries an identical set of keys — a missing
     field in any one of them would break the report.
 
     Args:
@@ -456,7 +456,6 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
             "evaluation_results": {
                 "fixes_evaluated": [],
                 "open_findings": [],
-                "report": "",
                 "summary": "No findings to evaluate.",
             },
             "metadata": {"total": 0, "approved": 0, "incorrect": 0, "incomplete": 0,
@@ -568,37 +567,13 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
         parts   = [f"{status_counts[s]} {s.lower()}" for s in ordered if status_counts.get(s)]
         summary = f"{total} finding(s) evaluated: " + ", ".join(parts) + "."
 
-        # Call create_review_report via MCP — once, after all pairs are processed
-        report = ""
-        server_params = StdioServerParameters(command="python", args=[MCP_SERVER_PATH])
-        try:
-            async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    logger.info("Calling create_review_report via MCP")
-                    mcp_result = await session.call_tool(
-                        "create_review_report",
-                        arguments={"fixes_evaluated": fixes_evaluated, "summary": summary},
-                    )
-                    raw    = mcp_result.content[0].text if mcp_result.content else ""
-                    parsed = json.loads(raw)
-                    if parsed.get("status") == "success" and "report" in parsed:
-                        report = parsed["report"]
-                    else:
-                        logger.error(
-                            "create_review_report returned error: %s",
-                            parsed.get("message", "unknown"),
-                        )
-        except Exception as e:
-            # report generation failing must not suppress the evaluation results
-            logger.error("create_review_report MCP call failed — report will be empty: %s", str(e))
-
+        # No report is built here anymore: the orchestrator's render_report layer renders the
+        # markdown report from this result, so the evaluator only returns the structured verdicts.
         return {
             "status": "success",
             "evaluation_results": {
                 "fixes_evaluated": fixes_evaluated,
                 "open_findings":   open_findings,
-                "report":          report,
                 "summary":         summary,
             },
             "metadata": {

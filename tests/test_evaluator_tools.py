@@ -133,7 +133,7 @@ _ENTRY_KEYS = {
 
 
 def test_evaluated_entry_has_full_schema():
-    """Every entry carries the complete key set create_review_report depends on."""
+    """Every entry carries the complete key set the render_report report renderer depends on."""
     entry = _evaluated_entry("B608", [4], "Security", "APPROVED", "code", ["ref"], "ok", "faithful", "pass", "complete")
 
     assert set(entry.keys()) == _ENTRY_KEYS
