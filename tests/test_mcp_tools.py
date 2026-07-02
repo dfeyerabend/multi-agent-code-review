@@ -274,7 +274,7 @@ def test_generate_fix_suggestion_line_out_of_range():
     result = json.loads(generate_fix_suggestion("x = 1\n", finding_line=99))
 
     assert result["status"] == "error"
-    assert "out of range" in result["message"]
+    assert "no usable line" in result["message"]
 
 
 def test_generate_fix_suggestion_line_zero():

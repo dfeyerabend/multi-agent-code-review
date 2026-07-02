@@ -58,7 +58,7 @@ Code Input (file path or raw string)
 | Enricher Agent | ✅ Done | Enriches findings with RAG context; batched to prevent context overflow |
 | Orchestrator | ✅ Done | Linear pipeline driver; owns pipeline state; builds per-agent input contracts |
 | Optimizer Agent | ✅ Done | Category-aware fix routing; Security/Logic/Maintainability processed individually, Style grouped by rule code |
-| Evaluator Agent | ✅ Done | LLM-as-Judge: judges each (finding, fix) pair, produces markdown report |
+| Evaluator Agent | ✅ Done | LLM-as-Judge: judges each fix scoped to its anchor lines; derives one of 6 statuses (APPROVED / INCORRECT / INCOMPLETE / NONCOMPLIANT / NO_FIX / NOT_EVALUATED) in Python; produces markdown report |
 | Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes (post-publish) |
 
 ---
@@ -124,7 +124,17 @@ The Evaluator Agent judges each (finding, fix) pair on three criteria:
 | Correctness | Is `suggested_code` valid Python that resolves the issue? |
 | Completeness | Does the fix address the whole finding? |
 
-Status is derived deterministically in Python from the three verdicts — not by the LLM.
+Status is derived deterministically in Python from the three verdicts — not by the LLM — via a priority cascade (code problems outrank guideline problems):
+
+| Status | Meaning |
+|---|---|
+| `APPROVED` | Correct, complete, and guideline-faithful (or no guideline applies) |
+| `INCORRECT` | Invalid Python or does not resolve the issue |
+| `INCOMPLETE` | Valid fix but only partially resolves the issue |
+| `NONCOMPLIANT` | Correct and complete, but violates a retrieved company/style guideline |
+| `NO_FIX` | Optimizer produced no fix for this finding |
+| `NOT_EVALUATED` | Evaluator hit max iterations or returned malformed output |
+
 `create_review_report` formats the results into a markdown report with a category × status overview table.
 ---
 
@@ -132,11 +142,11 @@ Status is derived deterministically in Python from the three verdicts — not by
 
 ```
 multi-agent-code-review/
-├── agent/
-│ ├── init.py
+├── agents/
+│ ├── __init__.py
 │ ├── agent_utils.py                # Shared utilities (MCP tool format conversion, chunking)
 │ ├── analyzer_agent.py             # Analyzer agent
-│ └── enricher_agent.py             # Enricher agent (batched)
+│ ├── enricher_agent.py             # Enricher agent (batched)
 │ ├── optimizer_agent.py            # Optimizer agent (category-aware routing)
 │ └── evaluator_agent.py            # Evaluator agent
 ├── knowledge_base/
@@ -146,7 +156,7 @@ multi-agent-code-review/
 │ ├── pyguide.md                    # Google Python Style Guide (CC-BY 3.0)
 │ └── company_rules.md              # example_company internal coding standards
 ├── tools/
-│ ├── init.py
+│ ├── __init__.py
 │ ├── analyzer_tools.py             # Local submit_analysis tool
 │ ├── enricher_tools.py             # Local submit_enrichment tool
 │ ├── optimizer_tools.py            # Local submit_optimization tool
@@ -156,13 +166,12 @@ multi-agent-code-review/
 │ ├── test_mcp_tools.py             # MCP tools + knowledge_search tests
 │ ├── test_analyzer_tools.py        # submit_analysis tests incl. deduplication
 │ ├── test_enricher_tools.py        # submit_enrichment schema validation tests
-│ ├── test_agent_utils.py           # chunk_list utility tests
 │ ├── test_rag_retrieval.py
 │ ├── test_optimizer_tools.py       # submit_optimization schema validation tests
-│ └── test_evaluator_tools.py       # submit_evaluation schema validation tests (pending)
+│ └── test_evaluator_tools.py       # submit_evaluation schema validation tests
 ├── config.py                       # Global settings, model config, system prompts
 ├── mcp_server.py                   # MCP server with all code analysis tools
-├── orchestrator.py                 # Pipeline driver — Analyzer → Enricher → (Optimizer stub)
+├── orchestrator.py                 # Pipeline driver — Analyzer → Enricher → Optimizer → Evaluator
 ├── requirements.txt
 ├── .env
 └── .gitignore
@@ -182,6 +191,7 @@ LLM agent behavior is not unit tested — it is non-deterministic and observed v
 | `tests/test_rag_retrieval.py` | ChromaDB retrieval — one targeted test per company rule, proving RAG context is active |
 | `tests/test_enricher_tools.py` | submit_enrichment local tool — schema validation, empty findings, type guards |
 | `tests/test_optimizer_tools.py` | `submit_optimization` local tool — schema validation, empty fixes, type guards |
+| `tests/test_evaluator_tools.py` | `submit_evaluation` local tool — schema validation, verdict enums, guard tests |
 
 ```bash
 pytest                   # full suite

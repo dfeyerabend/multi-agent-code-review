@@ -681,6 +681,101 @@ def _failure_fix(units: list, explanation: str) -> dict:
         return {"finding_keys": [], "suggested_code": None, "explanation": explanation, "grounded_in": []}
 
 
+# === SNIPPET CONTEXT PASS ===
+
+async def _attach_snippet_context(fixes: list, code: str, session) -> list:
+    """
+    Attaches a line-numbered original snippet and an anchor field to each real fix.
+
+    Pipeline: deterministic post-pass run by run_optimizer (this file) inside the
+    open MCP session, after all fixes are collected. For every fix that has
+    suggested_code, it calls the generate_fix_suggestion MCP tool to cut the
+    enclosing snippet, so the Evaluator can later judge against scoped, anchored
+    context instead of the whole file.
+
+    The snippet is fetched here (Optimizer owns the session) rather than in the
+    Evaluator, which deliberately holds no MCP session. Identity stays in Python:
+    anchor_lines is built from the fix's own finding_keys, never from the model.
+
+    Args:
+        fixes:   Fix dicts from _merge_fixes; each may carry finding_keys and
+                 suggested_code.
+        code:    Full source code string from the Analyzer.
+        session: Active MCP client session, shared across the optimizer run.
+
+    Returns:
+        List of fix dicts. Real fixes gain code_context (str) and anchor_lines
+        (str); null/failure fixes and any fix whose snippet could not be cut pass
+        through unchanged so nothing is dropped.
+    """
+    if not isinstance(fixes, list):
+        logger.error("_attach_snippet_context: fixes must be a list, got %s", type(fixes).__name__)
+        return []
+
+    # Without code or a session we cannot cut anything — return fixes untouched so the
+    # Evaluator simply falls back to full-file context instead of losing fixes.
+    if not isinstance(code, str) or session is None:
+        logger.error(
+            "_attach_snippet_context: missing code (%s) or session (%s) — skipping snippet pass",
+            type(code).__name__, session is not None,
+        )
+        return fixes
+
+    enriched = []
+    for i, fix in enumerate(fixes):
+        try:
+            # Only real fixes need context; null/failure fixes are never judged by the LLM.
+            if not isinstance(fix, dict) or fix.get("suggested_code") is None:
+                enriched.append(fix)
+                continue
+
+            # Union of every covered finding's lines = exactly what this one fix concerns.
+            union = sorted({
+                ln
+                for key in (fix.get("finding_keys") or [])
+                if isinstance(key, dict)
+                for ln in (key.get("lines") or [])
+                if isinstance(ln, int) and not isinstance(ln, bool)
+            })
+            if not union:
+                logger.warning("_attach_snippet_context: fixes[%d] has no usable lines — leaving without snippet", i)
+                enriched.append(fix)
+                continue
+
+            # One representative line suffices: a fix's findings overlap on a shared line and
+            # therefore live in the same function, whose body already covers the whole union.
+            mcp_result = await session.call_tool(
+                "generate_fix_suggestion",
+                arguments={"code": code, "finding_line": union[0]},
+            )
+            raw = mcp_result.content[0].text if mcp_result.content else ""
+            snippet = json.loads(raw)
+
+            # The tool falls back rather than failing, so success and fallback both yield a
+            # usable numbered snippet; only a hard error or missing field is unusable.
+            numbered = snippet.get("numbered_source")
+            if snippet.get("status") == "error" or not isinstance(numbered, str):
+                logger.warning(
+                    "_attach_snippet_context: fixes[%d] snippet unusable (status=%s) — leaving without snippet",
+                    i, snippet.get("status"),
+                )
+                enriched.append(fix)
+                continue
+
+            enriched.append({
+                **fix,
+                "code_context": numbered,
+                "anchor_lines": ", ".join(str(ln) for ln in union),  # explicit field matches the numbers in code_context
+            })
+
+        except Exception as e:
+            # one fix's snippet failure must never drop it or its siblings from the report
+            logger.error("_attach_snippet_context: failed to attach snippet for fixes[%d]: %s", i, str(e))
+            enriched.append(fix)
+
+    return enriched
+
+
 async def run_optimizer(code: str, enriched_findings: list) -> dict:
     """
     Connects to MCP, routes findings, generates fixes, returns merged output.

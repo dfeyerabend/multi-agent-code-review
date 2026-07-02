@@ -72,7 +72,7 @@ def _derive_status(verdicts: dict) -> str:
         logger.error("_derive_status failed unexpectedly: %s", str(e))
         return "NOT_EVALUATED"
 
-async def _run_evaluator_pair(code: str, issue: dict, fix: dict) -> dict:
+async def _run_evaluator_pair(code_context: str, anchor_lines: str, issue: dict, fix: dict) -> dict:
     """
     Runs one Evaluator LLM call for a single (issue, fix) pair.
 
@@ -80,18 +80,27 @@ async def _run_evaluator_pair(code: str, issue: dict, fix: dict) -> dict:
     is not None. Each call is fully independent — no shared state between pairs.
 
     Args:
-        code:  Full source code string from the Analyzer.
-        issue: Minimal issue dict with rationale and best_practice_refs.
-        fix:   Minimal fix dict with suggested_code, explanation, grounded_in.
+        code_context: Line-numbered snippet enclosing the fix's lines (or the full
+                      source as a fallback when no snippet was cut).
+        anchor_lines: Comma-separated line number(s) the fix actually concerns; the
+                      model must judge ONLY these, treating the rest as context.
+        issue:        Minimal issue dict with rationale and best_practice_refs.
+        fix:          Minimal fix dict with suggested_code, explanation, grounded_in.
 
     Returns:
         dict with evaluation verdicts on success, or a structured error dict
         with status 'max_iterations_reached' or 'error'.
     """
     try:
-        if not isinstance(code, str):
-            logger.error("_run_evaluator_pair: code must be a str, got %s", type(code).__name__)
-            return {"status": "error", "message": f"Invalid input: code must be str, got {type(code).__name__}"}
+        if not isinstance(code_context, str):
+            logger.error("_run_evaluator_pair: code_context must be a str, got %s", type(code_context).__name__)
+            return {"status": "error",
+                    "message": f"Invalid input: code_context must be str, got {type(code_context).__name__}"}
+
+        if not isinstance(anchor_lines, str):
+            logger.error("_run_evaluator_pair: anchor_lines must be a str, got %s", type(anchor_lines).__name__)
+            return {"status": "error",
+                    "message": f"Invalid input: anchor_lines must be str, got {type(anchor_lines).__name__}"}
 
         if not isinstance(issue, dict):
             logger.error("_run_evaluator_pair: issue must be a dict, got %s", type(issue).__name__)
@@ -101,10 +110,14 @@ async def _run_evaluator_pair(code: str, issue: dict, fix: dict) -> dict:
             logger.error("_run_evaluator_pair: fix must be a dict, got %s", type(fix).__name__)
             return {"status": "error", "message": f"Invalid input: fix must be dict, got {type(fix).__name__}"}
 
+        # Snippet + explicit anchor instead of the full file: the model judges only the
+        # anchored line(s), so a similar issue elsewhere can no longer make a correct fix
+        # look "partial".
         batch_input = {
-            "code": code,
-            "issue": issue,     # only rationale + best_practice_refs — identity fields stripped by caller
-            "fix": fix,         # only suggested_code + explanation + grounded_in
+            "code_context": code_context,
+            "anchor_lines": anchor_lines,
+            "issue": issue,  # only rationale + best_practice_refs — identity fields stripped by caller
+            "fix": fix,  # only suggested_code + explanation + grounded_in
         }
         messages = [{"role": "user", "content": json.dumps(batch_input, indent=2)}]
 
@@ -473,18 +486,28 @@ async def run_evaluator(code: str, enriched_findings: list, fixes: list) -> dict
 
             # Minimal LLM input: issue context recovered from the findings plus the fix's own
             # output. Identity is deliberately excluded — matching is already done in Python.
-            issue     = _issue_for_fix(fix, enriched_findings)
+            issue = _issue_for_fix(fix, enriched_findings)
             fix_input = {
                 "suggested_code": suggested_code,
-                "explanation":    fix.get("explanation", ""),
-                "grounded_in":    fix.get("grounded_in", []),
+                "explanation": fix.get("explanation", ""),
+                "grounded_in": fix.get("grounded_in", []),
             }
 
+            # Prefer the scoped, line-numbered snippet the Optimizer attached. Fall back to
+            # the full file with an empty anchor when it is missing, so a fix is still judged.
+            code_context = fix.get("code_context")
+            anchor_lines = fix.get("anchor_lines")
+            if not isinstance(code_context, str) or not code_context:
+                code_context = code
+                anchor_lines = ""
+            if not isinstance(anchor_lines, str):
+                anchor_lines = ""
+
             logger.info(
-                "Evaluating fix %d/%d covering %d finding(s)",
-                i + 1, len(fixes), len(fix.get("finding_keys") or []),
+                "Evaluating fix %d/%d covering %d finding(s) | anchor lines: %s",
+                i + 1, len(fixes), len(fix.get("finding_keys") or []), anchor_lines or "<full file>",
             )
-            result = await _run_evaluator_pair(code, issue, fix_input)
+            result = await _run_evaluator_pair(code_context, anchor_lines, issue, fix_input)
 
             # Layer 1a: agent ran out of iterations — predictable budget failure, not a bug.
             if result.get("status") == "max_iterations_reached":
@@ -603,22 +626,22 @@ if __name__ == "__main__":
     setup_logging()
 
     test_code = (
-        "import os, sys\n"
-        "def get_user(id):\n"
-        "    query = 'SELECT * FROM users WHERE id = ' + id\n"
-        "    return query\n"
-        "def list_users():\n"
-        "    pass\n"
-        "def fetch_data(user_id):\n"
-        "    return 'SELECT * FROM data WHERE id = ' + user_id\n"
+        "import os, sys\n"                                            # line 1: E401 + F401
+        "def load_config(path):\n"                                   # line 2
+        "    try:\n"                                                 # line 3
+        "        return _read_file(path)\n"                          # line 4
+        "    except OSError as exc:\n"                               # line 5
+        "        raise ValueError(f'Config not found: {path}')\n"    # line 6: B904 + §1.3 violation
+        "def list_users():\n"                                        # line 7
+        "    pass\n"                                                 # line 8
+        "def fetch_data(user_id):\n"                                 # line 9
+        "    return 'SELECT * FROM data WHERE id = ' + user_id\n"    # line 10: B608
     )
 
-    # Findings carry `lines` only (no `line`). _issue_for_fix recovers each fix's rationale
-    # from here by matching rule + overlapping lines.
+    # _issue_for_fix matches each fix back to its finding by rule + overlapping lines.
     test_enriched_findings = [
         {
-            # No best_practice_refs → its fix below should land faithfulness=not_applicable → APPROVED.
-            # This is the regression case for the false-"unfaithful" bug the redesign fixes.
+            # No refs → not_applicable → APPROVED.
             "rule": "E401",
             "lines": [1],
             "category": "Style",
@@ -628,7 +651,7 @@ if __name__ == "__main__":
             "doc_url": "https://docs.astral.sh/ruff/rules/multiple-imports-on-one-line",
         },
         {
-            # Same conflict group as E401 (both on line 1) — no refs either, same not_applicable check.
+            # Same line as E401, same conflict group, also no refs.
             "rule": "F401",
             "lines": [1],
             "category": "Logic",
@@ -638,24 +661,27 @@ if __name__ == "__main__":
             "doc_url": "https://docs.astral.sh/ruff/rules/unused-import",
         },
         {
-            # Has a real, applicable best_practice_ref. Its fix below follows it →
-            # faithfulness=faithful → APPROVED. Proves the genuine-faithful path still works.
-            "rule": "B608",
-            "lines": [3],
-            "category": "Security",
-            "severity": "HIGH",
-            "rationale": "String-based SQL query construction allows injection attacks.",
+            # rationale covers both halves of line 6, so §1.3 stays applicable for the fix below.
+            "rule": "B904",
+            "lines": [6],
+            "category": "Logic",
+            "severity": "MEDIUM",
+            "rationale": "An exception is raised inside an except clause without `from`, discarding the original cause.",
             "best_practice_refs": [
                 {
                     "source": "company_rules",
                     "section": "1.3",
-                    "text": "Never construct SQL queries via string concatenation.",
+                    "text": (
+                        "Never raise Python built-in exceptions (Exception, ValueError, "
+                        "RuntimeError) directly. All raised exceptions must be instances of "
+                        "AppError or one of its registered subclasses."
+                    ),
                 }
             ],
-            "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",
+            "doc_url": "https://docs.astral.sh/ruff/rules/raise-without-from-inside-except",
         },
         {
-            # No fix produced for this one (see test_fixes) → NO_FIX, no LLM call made.
+            # No fix produced for this one → NO_FIX, no LLM call.
             "rule": "W291",
             "lines": [1],
             "category": "Style",
@@ -665,10 +691,9 @@ if __name__ == "__main__":
             "doc_url": "https://docs.astral.sh/ruff/rules/trailing-whitespace",
         },
         {
-            # Has a real, applicable ref that its fix below deliberately ignores →
-            # faithfulness=unfaithful → NONCOMPLIANT (correct code, wrong guideline adherence).
+            # Fix below ignores this ref → unfaithful → NONCOMPLIANT.
             "rule": "C901",
-            "lines": [5],
+            "lines": [7],
             "category": "Maintainability",
             "severity": "LOW",
             "rationale": "Function should have a docstring explaining its purpose.",
@@ -682,10 +707,9 @@ if __name__ == "__main__":
             "doc_url": "https://google.github.io/styleguide/pyguide.html",
         },
         {
-            # Its fix below only renames the function without adding the required docstring →
-            # correctness=pass but completeness=incomplete → INCOMPLETE (a code-level problem).
+            # Fix below is a no-op, docstring still missing → INCOMPLETE.
             "rule": "D103",
-            "lines": [5],
+            "lines": [7],
             "category": "Maintainability",
             "severity": "LOW",
             "rationale": "Public function 'list_users' is missing a docstring.",
@@ -693,45 +717,21 @@ if __name__ == "__main__":
             "doc_url": "https://docs.astral.sh/ruff/rules/undocumented-public-function",
         },
         {
-            # rationale covers ONLY the SQL-injection bug; best_practice_refs additionally
-            # carries the company db_-prefix naming rule (plausible: RAG retrieved a broader
-            # company-rules chunk than the rationale literally states). The fix below fully
-            # resolves the injection (correctness=pass, completeness=complete — no escape
-            # hatch via "incomplete") but keeps the violating function name, so it should
-            # score faithfulness=unfaithful against §1.1 → NONCOMPLIANT, unambiguously.
+            # No company rule covers SQL concatenation, so no refs → not_applicable → APPROVED.
             "rule": "B608",
-            "lines": [8],
+            "lines": [10],
             "category": "Security",
             "severity": "HIGH",
-            "rationale": "String-based SQL query construction in a database-access function allows injection attacks.",
-            "best_practice_refs": [
-                {
-                    "source": "company_rules",
-                    "section": "1.1",
-                    "text": (
-                        "All functions that interact with a database must be prefixed with "
-                        "db_fetch_, db_save_, or db_delete_ depending on their operation."
-                    ),
-                },
-                {
-                    "source": "company_rules",
-                    "section": "1.3",
-                    "text": "Never construct SQL queries via string concatenation.",
-                },
-            ],
+            "rationale": "String-based SQL query construction allows injection attacks.",
+            "best_practice_refs": [],
             "doc_url": "https://bandit.readthedocs.io/en/latest/plugins/b608_hardcoded_sql_expressions.html",
         },
     ]
 
-    # Fixes mirror real Optimizer output: each carries finding_keys plus the model's own
-    # output. Exercises every status: a multi-finding fix with no refs (not_applicable →
-    # APPROVED), a faithful fix (faithful → APPROVED), a fix that ignores an applicable ref
-    # (unfaithful → NONCOMPLIANT), a fix that doesn't finish the job (→ INCOMPLETE), and a
-    # null fix (NO_FIX, no LLM call).
+    # Mirrors real Optimizer output: finding_keys for identity, plus the model's own fix.
     test_fixes = [
         {
-            # Covers E401 + F401 (line 1). grounded_in is empty — nothing to (dis)honestly cite,
-            # and best_practice_refs was empty too, so this should score not_applicable.
+            # Covers E401 + F401 on line 1.
             "finding_keys": [
                 {"rule": "E401", "lines": [1], "category": "Style"},
                 {"rule": "F401", "lines": [1], "category": "Logic"},
@@ -739,22 +739,35 @@ if __name__ == "__main__":
             "suggested_code": "import sys\n",
             "explanation": "Removed the unused 'os' import and split the combined import line.",
             "grounded_in": [],
-        },
-        {
-            # Covers B608 (line 3). Follows the cited company_rules ref → faithful.
-            "finding_keys": [
-                {"rule": "B608", "lines": [3], "category": "Security"},
-            ],
-            "suggested_code": (
-                "def get_user(id):\n"
-                "    query = 'SELECT * FROM users WHERE id = ?'\n"
-                "    return query, (id,)\n"
+            "code_context": (
+                "1 | import os, sys\n"
+                "2 | def load_config(path):\n"
+                "3 |     try:\n"
+                "4 |         return _read_file(path)\n"
+                "5 |     except OSError as exc:\n"
+                "6 |         raise ValueError(f'Config not found: {path}')"
             ),
-            "explanation": "Replaced string concatenation with a parameterized query.",
-            "grounded_in": ["company_rules §1.3"],
+            "anchor_lines": "1",
         },
         {
-            # Covers W291 (line 1). Optimizer produced nothing → NO_FIX, no LLM call.
+            # Covers B904. Adds `from exc` but keeps ValueError → unfaithful to §1.3 → NONCOMPLIANT.
+            "finding_keys": [
+                {"rule": "B904", "lines": [6], "category": "Logic"},
+            ],
+            "suggested_code": "        raise ValueError(f'Config not found: {path}') from exc\n",
+            "explanation": "Chained the exception with `from exc` to preserve the original cause.",
+            "grounded_in": [],
+            "code_context": (
+                "2 | def load_config(path):\n"
+                "3 |     try:\n"
+                "4 |         return _read_file(path)\n"
+                "5 |     except OSError as exc:\n"
+                "6 |         raise ValueError(f'Config not found: {path}')"
+            ),
+            "anchor_lines": "6",
+        },
+        {
+            # Covers W291. No fix produced → NO_FIX, no snippet.
             "finding_keys": [
                 {"rule": "W291", "lines": [1], "category": "Style"},
             ],
@@ -763,47 +776,49 @@ if __name__ == "__main__":
             "grounded_in": [],
         },
         {
-            # Covers C901 (line 5). A no-op that adds no docstring at all — the code does
-            # nothing toward resolving the issue, so a strict judge may call this
-            # correctness=fail → INCORRECT rather than NONCOMPLIANT (observed in practice:
-            # the model judged INCORRECT here, since there's no work done to assess
-            # faithfulness against). Kept as a deliberately ambiguous no-op case; see the
-            # B608/db_-prefix fix below for the unambiguous NONCOMPLIANT case.
+            # Covers C901, scoped to list_users.
             "finding_keys": [
-                {"rule": "C901", "lines": [5], "category": "Maintainability"},
+                {"rule": "C901", "lines": [7], "category": "Maintainability"},
             ],
             "suggested_code": "def list_users():\n    pass\n",
             "explanation": "Renamed for clarity; behavior unchanged.",
             "grounded_in": ["pyguide §3.8.1"],
+            "code_context": (
+                "7 | def list_users():\n"
+                "8 |     pass"
+            ),
+            "anchor_lines": "7",
         },
         {
-            # Covers D103 (line 5). Same code as above: still no docstring, so the core of
-            # the issue (missing docstring) is unaddressed — correctness=pass but
-            # completeness should score incomplete → INCOMPLETE.
+            # Covers D103, same scope as above.
             "finding_keys": [
-                {"rule": "D103", "lines": [5], "category": "Maintainability"},
+                {"rule": "D103", "lines": [7], "category": "Maintainability"},
             ],
             "suggested_code": "def list_users():\n    pass\n",
             "explanation": "No-op placeholder; docstring not added.",
             "grounded_in": [],
+            "code_context": (
+                "7 | def list_users():\n"
+                "8 |     pass"
+            ),
+            "anchor_lines": "7",
         },
         {
-            # Covers B608 (line 8). Fully fixes the injection (correctness=pass,
-            # completeness=complete — nothing left to call "incomplete"), but keeps the
-            # function named `fetch_data` instead of the required `db_fetch_` prefix from
-            # §1.1, which IS in best_practice_refs. grounded_in only cites §1.3 (the rule it
-            # followed) — no dishonest citation, just a guideline it silently ignored. This
-            # is the unambiguous correct-but-noncompliant case: should score
-            # faithfulness=unfaithful → NONCOMPLIANT.
+            # Covers B608. Correct fix, no matching company rule → APPROVED.
             "finding_keys": [
-                {"rule": "B608", "lines": [8], "category": "Security"},
+                {"rule": "B608", "lines": [10], "category": "Security"},
             ],
             "suggested_code": (
                 "def fetch_data(user_id):\n"
                 "    return db.execute('SELECT * FROM data WHERE id = %s', (user_id,))\n"
             ),
             "explanation": "Replaced string concatenation with a parameterized query to prevent SQL injection.",
-            "grounded_in": ["company_rules §1.3"],
+            "grounded_in": [],
+            "code_context": (
+                " 9 | def fetch_data(user_id):\n"
+                "10 |     return 'SELECT * FROM data WHERE id = ' + user_id"
+            ),
+            "anchor_lines": "10",
         },
     ]
 

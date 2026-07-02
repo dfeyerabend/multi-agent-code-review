@@ -581,42 +581,155 @@ def knowledge_search(query: str, category: str = "", n_results: int = 3) -> str:
             "message": str(e),
         }, indent=2)
 
+# === SNIPPET HELPERS ===
+
+@mcp.tool()
+def _enclosing_snippet(code: str, lines: list) -> dict:
+    """
+    Extracts the smallest function source enclosing a set of finding lines.
+
+    Pipeline: server-side core of the generate_fix_suggestion tool (this file).
+    Called there with a single finding line during the Optimizer agent loop, and
+    reused for the union of a fix's lines so the Evaluator can later judge against
+    a scoped, line-numbered snippet instead of the whole file.
+
+    Falls back to a fixed window around the anchor lines when the code does not
+    parse or no single function spans every anchor line — partial context beats
+    none.
+
+    Args:
+        code:  Python source — full file or raw snippet.
+        lines: 1-based line numbers to enclose. Non-int and out-of-range entries
+               are dropped; the call fails only if none remain.
+
+    Returns:
+        dict with status "success" | "fallback" | "error".
+        On success/fallback: function_name (str|None), function_source (str),
+        numbered_source (str, same lines prefixed with their 1-based number),
+        start_line (int), end_line (int), context_type ("function" |
+        "surrounding_lines"), and fallback_reason (str, only when "fallback").
+        On error: message (str).
+    """
+    # code and lines feed splitlines()/ast.parse — a wrong type would raise deep
+    # inside, so reject it loudly before any work begins.
+    if not isinstance(code, str):
+        logger.error("_enclosing_snippet: code must be a str, got %s", type(code).__name__)
+        return {"status": "error", "message": f"_enclosing_snippet failed — code must be a string, got {type(code).__name__}"}
+
+    if not isinstance(lines, list):
+        logger.error("_enclosing_snippet: lines must be a list, got %s", type(lines).__name__)
+        return {"status": "error", "message": f"_enclosing_snippet failed — lines must be a list, got {type(lines).__name__}"}
+
+    try:
+        if not code.strip():
+            logger.warning("_enclosing_snippet: empty code received")
+            return {"status": "error", "message": "_enclosing_snippet failed — code must not be empty."}
+
+        source_lines = code.splitlines()
+        total_lines = len(source_lines)
+
+        # bool is an int subclass — exclude it so True/False cannot pose as a line number.
+        usable = sorted({
+            ln for ln in lines
+            if isinstance(ln, int) and not isinstance(ln, bool) and 1 <= ln <= total_lines
+        })
+        if not usable:
+            logger.warning(
+                "_enclosing_snippet: no usable in-range line among %r (file has %d lines)",
+                lines, total_lines,
+            )
+            return {"status": "error", "message": f"_enclosing_snippet failed — no usable line in range 1–{total_lines} among {lines}."}
+
+        anchor_lo, anchor_hi = usable[0], usable[-1]
+
+        # Number every returned line with its real 1-based file position: the explicit
+        # anchor field is only trustworthy if the model can SEE the matching number in
+        # the snippet — LLMs miscount unannotated source lines.
+        def _render(start: int, end: int) -> str:
+            width = len(str(end))
+            return "\n".join(
+                f"{n:>{width}} | {source_lines[n - 1]}"
+                for n in range(start, end + 1)
+            )
+
+        # Defined inline so it closes over source_lines/anchors: callers must always get a
+        # snippet, even when AST scoping is impossible.
+        def _surrounding(reason: str) -> dict:
+            start = max(1, anchor_lo - 5)
+            end = min(total_lines, anchor_hi + 5)
+            logger.info("_enclosing_snippet fallback: %s | lines %d–%d", reason, start, end)
+            return {
+                "status": "fallback",
+                "fallback_reason": reason,
+                "function_name": None,
+                "function_source": "\n".join(source_lines[start - 1:end]),
+                "numbered_source": _render(start, end),
+                "start_line": start,
+                "end_line": end,
+                "context_type": "surrounding_lines",
+            }
+
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return _surrounding(f"SyntaxError at line {e.lineno}: {e.msg}")
+
+        # Keep only functions spanning EVERY anchor line: a single fix's findings must
+        # share one common scope, or the snippet would frame the wrong code.
+        candidates = [
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.lineno <= anchor_lo and anchor_hi <= node.end_lineno
+        ]
+        if not candidates:
+            return _surrounding("no single function encloses all anchor lines")
+
+        # Innermost = smallest line span, so a nested function wins over its outer scope.
+        innermost = min(candidates, key=lambda n: n.end_lineno - n.lineno)
+        start, end = innermost.lineno, innermost.end_lineno
+
+        logger.info("_enclosing_snippet: function '%s' lines %d–%d", innermost.name, start, end)
+        return {
+            "status": "success",
+            "function_name": innermost.name,
+            "function_source": "\n".join(source_lines[start - 1:end]),
+            "numbered_source": _render(start, end),
+            "start_line": start,
+            "end_line": end,
+            "context_type": "function",
+        }
+
+    except Exception as e:
+        logger.error("_enclosing_snippet failed unexpectedly for lines %r: %s", lines, str(e))
+        return {"status": "error", "message": f"_enclosing_snippet failed unexpectedly: {str(e)}"}
+
 @mcp.tool()
 def generate_fix_suggestion(code: str, finding_line: int) -> str:
     """
     Extracts the function source that contains a given finding line.
 
-    Pipeline: called by the Optimizer Agent once per finding, before generating
-    a fix. Returns the narrowest possible context so the Optimizer works on
-    real code, not just the flagged line.
+    Pipeline: called by the Optimizer Agent once per finding, before generating a
+    fix, to work on real surrounding code rather than the flagged line alone. Thin
+    wrapper over _enclosing_snippet (this file), which does the AST scoping and
+    line numbering; this layer only validates the tool's single-line contract and
+    serialises the result.
 
     The tool never crashes the pipeline. When full context cannot be extracted
-    (syntax error, line outside any function) it falls back to surrounding lines
-    and sets status="fallback" so the Evaluator can flag limited-context fixes.
+    (syntax error, line outside any function) _enclosing_snippet falls back to
+    surrounding lines and sets status="fallback" so the Optimizer can flag
+    limited-context fixes.
 
     Args:
-        code:           Python source code — either a full file or a raw snippet.
-        finding_line:   1-based line number from the finding.
+        code:         Python source — either a full file or a raw snippet.
+        finding_line: 1-based line number from the finding.
 
     Returns:
-        JSON string with fields:
-        - status:           "success" | "fallback" | "error"
-        - function_name:    Name of the enclosing function, or null on fallback.
-        - function_source:  Extracted source lines as a single string.
-        - start_line:       1-based index of the first returned line.
-        - end_line:         1-based index of the last returned line.
-        - context_type:     "function" | "surrounding_lines"
-        - fallback_reason:  Present only when status="fallback".
+        JSON string with the fields from _enclosing_snippet: status, function_name,
+        function_source, numbered_source, start_line, end_line, context_type, and
+        (on fallback) fallback_reason — or status="error" with a message.
     """
-    # Both args are model-supplied: finding_line drives range math and code feeds
-    # splitlines()/ast.parse — a wrong type would raise before the guards below run.
-    if not isinstance(code, str):
-        logger.error("generate_fix_suggestion: code must be a str, got %s", type(code).__name__)
-        return json.dumps({
-            "status": "error",
-            "message": f"generate_fix_suggestion failed — code must be a string, got {type(code).__name__}",
-        }, indent=2)
-
+    # finding_line is model-supplied and is the tool's whole contract; validate it
+    # here so the caller gets a single-line-specific message, then delegate the rest.
     if not isinstance(finding_line, int) or isinstance(finding_line, bool):
         logger.error("generate_fix_suggestion: finding_line must be an int, got %s", type(finding_line).__name__)
         return json.dumps({
@@ -626,95 +739,11 @@ def generate_fix_suggestion(code: str, finding_line: int) -> str:
 
     logger.info("generate_fix_suggestion called | finding_line=%d", finding_line)
 
-    try:
-        # --- Guard: empty code ---
-        if not code.strip():
-            logger.warning("generate_fix_suggestion: empty code received")
-            return json.dumps({
-                "status": "error",
-                "message": "code must not be empty.",
-            }, indent=2)
+    # code-type, empty, out-of-range and AST handling all live in the shared helper —
+    # a single line is just the one-element union case.
+    result = _enclosing_snippet(code, [finding_line])
+    return json.dumps(result, indent=2)
 
-        lines = code.splitlines()
-        total_lines = len(lines)
-
-        # --- Guard: line out of range ---
-        if finding_line < 1 or finding_line > total_lines:
-            logger.warning(
-                "generate_fix_suggestion: finding_line=%d out of range (1–%d)",
-                finding_line, total_lines,
-            )
-            return json.dumps({
-                "status": "error",
-                "message": (
-                    f"finding_line {finding_line} is out of range "
-                    f"(file has {total_lines} lines)."
-                ),
-            }, indent=2)
-
-        # --- Helper: surrounding-lines fallback ---
-        # Defined here so it closes over `lines`, `total_lines`, and `finding_line`
-        def _surrounding_lines(reason: str) -> str:
-            n = 5
-            start = max(1, finding_line - n)
-            end = min(total_lines, finding_line + n)
-            snippet = "\n".join(lines[start - 1: end])
-            logger.info(
-                "generate_fix_suggestion fallback: %s | lines %d–%d", reason, start, end
-            )
-            return json.dumps({
-                "status": "fallback",
-                "fallback_reason": reason,
-                "function_name": None,
-                "function_source": snippet,
-                "start_line": start,
-                "end_line": end,
-                "context_type": "surrounding_lines",
-            }, indent=2)
-
-        # --- Happy path: AST parse ---
-        try:
-            tree = ast.parse(code)
-        except SyntaxError as e:
-            # Code has a syntax error — surrounding lines is the best we can do
-            return _surrounding_lines(f"SyntaxError at line {e.lineno}: {e.msg}")
-
-        # Walk all FunctionDef nodes and keep those whose line range spans finding_line
-        candidates = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.lineno <= finding_line <= node.end_lineno:
-                    candidates.append(node)
-
-        if not candidates:
-            return _surrounding_lines("finding_line is not inside any function")
-
-        # Innermost function = smallest line range (nested functions have smaller spans)
-        innermost = min(candidates, key=lambda n: n.end_lineno - n.lineno)
-
-        start = innermost.lineno
-        end = innermost.end_lineno
-        snippet = "\n".join(lines[start - 1: end])
-
-        logger.info(
-            "generate_fix_suggestion: function '%s' lines %d–%d",
-            innermost.name, start, end,
-        )
-        return json.dumps({
-            "status": "success",
-            "function_name": innermost.name,
-            "function_source": snippet,
-            "start_line": start,
-            "end_line": end,
-            "context_type": "function",
-        }, indent=2)
-
-    except Exception as e:
-        logger.error("generate_fix_suggestion failed unexpectedly: %s", str(e))
-        return json.dumps({
-            "status": "error",
-            "message": f"generate_fix_suggestion failed unexpectedly: {str(e)}",
-        }, indent=2)
 
 # --- TOOL 5: Create Review Report ---
 @mcp.tool()
