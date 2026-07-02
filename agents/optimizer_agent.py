@@ -914,6 +914,9 @@ async def run_optimizer(code: str, enriched_findings: list) -> dict:
 
                         all_fixes.extend(fixes)
 
+                # Snippet context pass: attach code_context + anchor_lines per real fix
+                all_fixes = await _attach_snippet_context(all_fixes, code, session)
+
                 total = len(all_fixes)
                 summary = (
                     f"{total - failed_count} fix(es) generated, "
