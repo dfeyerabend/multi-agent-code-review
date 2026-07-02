@@ -285,3 +285,10 @@ def setup_logging() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Third-party per-request chatter (one httpx line per LLM call, MCP transport noise)
+    # would bury the user-facing pipeline output. Silence it below WARNING unless the user
+    # explicitly asked for DEBUG, where full tracing is wanted again.
+    if LOG_LEVEL != "DEBUG":
+        for noisy in ("httpx", "httpcore", "anthropic", "mcp"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
