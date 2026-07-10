@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "COMPANY-1.1",
+      "section": "1.1",
+      "mechanism": "naming_convention",
+      "category": "Maintainability",
+      "severity": "MEDIUM",
+      "message": "Function accesses the database but is not prefixed with db_fetch_/db_save_/db_delete_",
+      "params": {
+        "trigger_calls": ["db.query", "db.execute", "db.delete"],
+        "required_prefixes": ["db_fetch_", "db_save_", "db_delete_"]
+      }
+    },
+    {
+      "id": "COMPANY-1.2",
+      "section": "1.2",
+      "mechanism": "required_comment",
+      "category": "Maintainability",
+      "severity": "LOW",
+      "message": "Function is missing a '# REASON:' comment on or directly below the def line",
+      "params": {
+        "marker": "# REASON:",
+        "max_lines_below": 1
+      }
+    },
+    {
+      "id": "COMPANY-1.3",
+      "section": "1.3",
+      "mechanism": "forbidden_raise",
+      "category": "Logic",
+      "severity": "MEDIUM",
+      "message": "Raises a built-in exception; must raise AppError or a registered subclass",
+      "params": {
+        "forbidden": [
+          "Exception", "BaseException", "ValueError", "TypeError",
+          "RuntimeError", "KeyError", "IndexError", "FileNotFoundError",
+          "OSError", "AttributeError"
+        ]
+      }
+    },
+    {
+      "id": "COMPANY-1.4",
+      "section": "1.4",
+      "mechanism": "forbidden_access",
+      "category": "Security",
+      "severity": "HIGH",
+      "message": "Direct environment access; use Config.get() instead of os.environ/os.getenv",
+      "params": {
+        "targets": ["os.getenv", "os.environ"]
+      }
+    }
+  ]
+}
