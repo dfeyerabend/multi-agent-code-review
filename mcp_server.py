@@ -8,11 +8,12 @@ import os
 import ast
 import sys
 import json
-import subprocess
-import tempfile
 import chromadb
 from config import CHROMA_DB_PATH
 from mcp.server.fastmcp import FastMCP
+from mcp_helpers.scanners import _write_temp_file, _run_cli_tool, _ruff_category, _ruff_severity
+from mcp_helpers.snippets import _enclosing_snippet
+from mcp_helpers.company_rules import _company_load_rules, _company_run_checks
 
 # Setup Logging
 import logging
@@ -106,143 +107,6 @@ def read_code(source: str) -> str:
             "message": f"read_code failed unexpectedly: {str(e)}",
         }, indent=2)
 
-# --- Helper: write code to temp file for CLI tools ---
-def _write_temp_file(code: str) -> str | None:
-    """
-    Writes code to a temporary .py file, returns the file path.
-
-    Pipeline: helper used by detect_syntax_errors before invoking ruff and bandit.
-
-    Args:
-        code: Python source code to write.
-
-    Returns:
-        The temp file path on success, or None on failure — the caller treats
-        None as a hard failure and reports it (this helper never raises).
-    """
-    if not isinstance(code, str):
-        logger.error("_write_temp_file: code must be a str, got %s", type(code).__name__)
-        return None
-
-    try:
-        tmp = tempfile.NamedTemporaryFile(      # persists after close so ruff/bandit can read it
-            mode="w",
-            suffix=".py",
-            delete=False,
-            encoding="utf-8",
-        )
-        tmp.write(code)
-        if not code.endswith("\n"):
-            tmp.write("\n")                     # prevent false W292 from the tempfile method
-        tmp.close()                             # close so ruff/bandit can read it
-        return tmp.name
-
-    except Exception as e:
-        logger.error("_write_temp_file failed unexpectedly: %s", str(e))
-        return None
-
-# --- Helper: run a CLI tool and capture output ---
-def _run_cli_tool(command: list[str]) -> dict:
-    """
-    Runs a CLI command in a detached subprocess, returns parsed JSON or error info.
-
-    Pipeline: helper used by detect_syntax_errors to invoke ruff and bandit.
-    Runs inside the MCP server process, which itself is a STDIO child of the agent.
-
-    Args:
-        command: Full argument vector, e.g. ["bandit", "-f", "json", "-q", path].
-
-    Returns:
-        dict with status "success" plus "data"/"raw_output", or status "error"
-        with a message naming the tool and the likely cause.
-    """
-    if not isinstance(command, list) or not command:
-        logger.error("_run_cli_tool: command must be a non-empty list, got %r", command)
-        return {
-            "status": "error",
-            "message": f"_run_cli_tool failed — command must be a non-empty list, got {type(command).__name__}",
-        }
-
-    tool_name = command[0]
-    logger.debug("Executing: %s", " ".join(command[:4]))
-
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,                    # capture stdout and stderr
-            text=True,                              # decode output as string
-            timeout=30,                             # fails if tool call does not work
-            stdin=subprocess.DEVNULL,               # detach the inherited JSON-RPC pipe: bandit's Python startup blocks on it otherwise
-        )
-
-        logger.debug("%s exit code: %d", tool_name, result.returncode)
-
-        # both ruff and bandit return JSON to stdout
-        if result.stdout.strip():
-            try:
-                return {"status": "success", "data": json.loads(result.stdout)}
-            except json.JSONDecodeError:
-                return {"status": "success", "raw_output": result.stdout.strip()}
-
-        # no stdout — might be clean (no issues) or an error
-        if result.returncode == 0:
-            return {"status": "success", "data": []}  # clean run, no issues found
-
-        # fallback return for non-zero exit
-        return {
-            "status": "error",
-            "message": f"{tool_name} exited with code {result.returncode}: {result.stderr.strip() or 'no output'}"
-        }
-
-    except FileNotFoundError:  # tool not installed or not in PATH
-        return {
-            "status": "error",
-            "message": f"'{tool_name}' not found. Install with: pip install {tool_name}"
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "error",
-            "message": f"{tool_name} timed out after 30 seconds",  # name the tool so a degraded scan is traceable
-        }
-    except Exception as e:
-        logger.error("_run_cli_tool: %s failed unexpectedly: %s", tool_name, str(e))
-        return {
-            "status": "error",
-            "message": f"{tool_name} failed unexpectedly: {str(e)}",
-        }
-
-# Help function to map ruff categories
-def _ruff_category(rule_code: str) -> str:
-    """Maps ruff rule prefixes to high-level categories."""
-    if rule_code.startswith("S"): # Currently not used because bandit handels security
-        return "Security"
-    if rule_code.startswith("E9"):
-        return "Logic"               # syntax errors
-    if rule_code.startswith(("F", "B")):
-        return "Logic"               # pyflakes + bugbear (likely bugs)
-    if rule_code.startswith("C"):
-        return "Maintainability"     # complexity
-    if rule_code.startswith(("E", "W")):
-        return "Style"
-    return "Style"                   # safe default
-
-def _ruff_severity(rule_code: str) -> str:
-    """
-    Maps ruff rule codes to severity levels.
-    This is a rough heuristic — ruff doesn't have built-in severity.
-    """
-
-    # S-rules are security related (bandit-equivalent rules in ruff)
-    if rule_code.startswith("S"):                                       # expected output: "code": "S101" -> security concerns - similar to bandit
-        return "HIGH"
-    # E9xx are syntax errors, F-rules are pyflakes (logic errors)
-    if rule_code.startswith("E9") or rule_code.startswith("F"):         # expected output: "code": "E902" -> syntax errors, or "F401" -> Pyflakes, logic errors
-        return "HIGH"
-    # C/W are complexity and warnings
-    if rule_code.startswith("C") or rule_code.startswith("W"):          # expected output: "code": "C901" -> complexity, or "W291" -> warnings
-        return "MEDIUM"
-    # everything else (style, formatting)
-    return "LOW"
 
 # --- TOOL 2: Detect Syntax Errors ---
 @mcp.tool()
@@ -514,6 +378,7 @@ def extract_code_structure(code: str) -> str:
             "message": f"extract_code_structure failed unexpectedly: {str(e)}",
         }, indent=2)
 
+
 # --- TOOL 4: Knowledge Search (RAG) ---
 @mcp.tool()
 def knowledge_search(query: str, category: str = "", n_results: int = 3) -> str:
@@ -581,128 +446,87 @@ def knowledge_search(query: str, category: str = "", n_results: int = 3) -> str:
             "message": str(e),
         }, indent=2)
 
-# === SNIPPET HELPERS ===
 
+# --- TOOL 5: Check Company Rules ---
 @mcp.tool()
-def _enclosing_snippet(code: str, lines: list) -> dict:
+def check_company_rules(code: str) -> str:
     """
-    Extracts the smallest function source enclosing a set of finding lines.
+    Runs the company-specific coding rules against Python code (AST-based).
 
-    Pipeline: server-side core of the generate_fix_suggestion tool (this file).
-    Called there with a single finding line during the Optimizer agent loop, and
-    reused for the union of a fix's lines so the Evaluator can later judge against
-    a scoped, line-numbered snippet instead of the whole file.
-
-    Falls back to a fixed window around the anchor lines when the code does not
-    parse or no single function spans every anchor line — partial context beats
-    none.
+    Pipeline: MCP tool called by the Analyzer agent, alongside detect_syntax_errors —
+    the company-rule counterpart to the ruff/bandit scan. Loads the rule set from
+    company_rules.json, runs each rule's mechanism against the code, and returns the
+    findings in the same schema. Its output is assembled into analysis_results by
+    _assemble_analysis (agents/analyzer_agent.py).
 
     Args:
-        code:  Python source — full file or raw snippet.
-        lines: 1-based line numbers to enclose. Non-int and out-of-range entries
-               are dropped; the call fails only if none remain.
+        code: Python source code as a string.
 
     Returns:
-        dict with status "success" | "fallback" | "error".
-        On success/fallback: function_name (str|None), function_source (str),
-        numbered_source (str, same lines prefixed with their 1-based number),
-        start_line (int), end_line (int), context_type ("function" |
-        "surrounding_lines"), and fallback_reason (str, only when "fallback").
-        On error: message (str).
+        JSON string. status is "clean" (no violations, all rules ran), "issues_found"
+        (violations present), "partial" (at least one rule failed — result incomplete
+        and must not be trusted as clean), or "error" (code unparseable or rule set
+        unavailable). rule_errors carries the per-rule failure messages.
     """
-    # code and lines feed splitlines()/ast.parse — a wrong type would raise deep
-    # inside, so reject it loudly before any work begins.
+    # model-supplied input feeds ast.parse/splitlines — reject a non-string up front
     if not isinstance(code, str):
-        logger.error("_enclosing_snippet: code must be a str, got %s", type(code).__name__)
-        return {"status": "error", "message": f"_enclosing_snippet failed — code must be a string, got {type(code).__name__}"}
+        logger.error("check_company_rules: code must be a str, got %s", type(code).__name__)
+        return json.dumps({
+            "status": "error",
+            "message": f"check_company_rules failed — code must be a string, got {type(code).__name__}",
+        }, indent=2)
 
-    if not isinstance(lines, list):
-        logger.error("_enclosing_snippet: lines must be a list, got %s", type(lines).__name__)
-        return {"status": "error", "message": f"_enclosing_snippet failed — lines must be a list, got {type(lines).__name__}"}
+    logger.info("check_company_rules called (%d lines)", len(code.splitlines()))
 
     try:
-        if not code.strip():
-            logger.warning("_enclosing_snippet: empty code received")
-            return {"status": "error", "message": "_enclosing_snippet failed — code must not be empty."}
-
-        source_lines = code.splitlines()
-        total_lines = len(source_lines)
-
-        # bool is an int subclass — exclude it so True/False cannot pose as a line number.
-        usable = sorted({
-            ln for ln in lines
-            if isinstance(ln, int) and not isinstance(ln, bool) and 1 <= ln <= total_lines
-        })
-        if not usable:
-            logger.warning(
-                "_enclosing_snippet: no usable in-range line among %r (file has %d lines)",
-                lines, total_lines,
-            )
-            return {"status": "error", "message": f"_enclosing_snippet failed — no usable line in range 1–{total_lines} among {lines}."}
-
-        anchor_lo, anchor_hi = usable[0], usable[-1]
-
-        # Number every returned line with its real 1-based file position: the explicit
-        # anchor field is only trustworthy if the model can SEE the matching number in
-        # the snippet — LLMs miscount unannotated source lines.
-        def _render(start: int, end: int) -> str:
-            width = len(str(end))
-            return "\n".join(
-                f"{n:>{width}} | {source_lines[n - 1]}"
-                for n in range(start, end + 1)
-            )
-
-        # Defined inline so it closes over source_lines/anchors: callers must always get a
-        # snippet, even when AST scoping is impossible.
-        def _surrounding(reason: str) -> dict:
-            start = max(1, anchor_lo - 5)
-            end = min(total_lines, anchor_hi + 5)
-            logger.info("_enclosing_snippet fallback: %s | lines %d–%d", reason, start, end)
-            return {
-                "status": "fallback",
-                "fallback_reason": reason,
-                "function_name": None,
-                "function_source": "\n".join(source_lines[start - 1:end]),
-                "numbered_source": _render(start, end),
-                "start_line": start,
-                "end_line": end,
-                "context_type": "surrounding_lines",
-            }
-
+        # AST-based check: unparseable code fails here; the syntax error itself is reported by detect_syntax_errors
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
-            return _surrounding(f"SyntaxError at line {e.lineno}: {e.msg}")
+            return json.dumps({
+                "status": "error",
+                "message": f"check_company_rules — cannot parse code: {e.msg} at line {e.lineno}",
+            }, indent=2)
 
-        # Keep only functions spanning EVERY anchor line: a single fix's findings must
-        # share one common scope, or the snippet would frame the wrong code.
-        candidates = [
-            node for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.lineno <= anchor_lo and anchor_hi <= node.end_lineno
-        ]
-        if not candidates:
-            return _surrounding("no single function encloses all anchor lines")
+        rules_result = _company_load_rules()        # mcp_helpers.company_rules: reads + validates company_rules.json
+        if rules_result["status"] != "success":
+            return json.dumps({
+                "status": "error",
+                "message": f"check_company_rules — rule set unavailable: {rules_result['message']}",
+            }, indent=2)
 
-        # Innermost = smallest line span, so a nested function wins over its outer scope.
-        innermost = min(candidates, key=lambda n: n.end_lineno - n.lineno)
-        start, end = innermost.lineno, innermost.end_lineno
+        # mcp_helpers.company_rules: dispatches each rule to its mechanism and isolates per-rule failures
+        run = _company_run_checks(tree, code.splitlines(), rules_result["rules"])
+        findings = run["findings"]
+        rule_errors = run["rule_errors"]
 
-        logger.info("_enclosing_snippet: function '%s' lines %d–%d", innermost.name, start, end)
-        return {
-            "status": "success",
-            "function_name": innermost.name,
-            "function_source": "\n".join(source_lines[start - 1:end]),
-            "numbered_source": _render(start, end),
-            "start_line": start,
-            "end_line": end,
-            "context_type": "function",
-        }
+        if rule_errors:
+            status = "partial"                      # a failed rule leaves the run incomplete, not clean
+        elif findings:
+            status = "issues_found"
+        else:
+            status = "clean"
+
+        logger.info("check_company_rules complete: %d finding(s), status=%s", len(findings), status)
+        if rule_errors:
+            logger.warning("check_company_rules: incomplete run — rule_errors: %s", rule_errors)
+
+        return json.dumps({
+            "status": status,
+            "total_findings": len(findings),
+            "rule_errors": rule_errors,             # empty dict when every rule ran cleanly
+            "findings": findings,
+        }, indent=2)
 
     except Exception as e:
-        logger.error("_enclosing_snippet failed unexpectedly for lines %r: %s", lines, str(e))
-        return {"status": "error", "message": f"_enclosing_snippet failed unexpectedly: {str(e)}"}
+        logger.error("check_company_rules failed unexpectedly: %s", str(e))
+        return json.dumps({
+            "status": "error",
+            "message": f"check_company_rules failed unexpectedly: {str(e)}",
+        }, indent=2)
 
+
+# --- TOOL 6: Generate Fix Suggestion ---
 @mcp.tool()
 def generate_fix_suggestion(code: str, finding_line: int) -> str:
     """
@@ -751,16 +575,3 @@ if __name__ == "__main__":
     setup_logging()                     # configure root logger once before server starts
 
     mcp.run(transport="stdio")
-
-
-
-
-
-
-
-
-
-
-
-
-

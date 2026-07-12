@@ -18,7 +18,7 @@ Code Input (file path or raw string)
         ▼
 ┌───────────────────────────┐
 │      Analyzer Agent       │  ← MCP tools: read_code, detect_syntax_errors,
-│  Static analysis + AST    │    extract_code_structure
+│  Static analysis + AST    │    extract_code_structure, check_company_rules
 │  parsing                  │  ← Local tool: submit_analysis (structured output)
 └────────────┬──────────────┘
              │ structured JSON
@@ -50,16 +50,16 @@ Code Input (file path or raw string)
 
 ## Component Status
 
-| Component | Status | Description |
-|---|---|---|
-| MCP Server (`mcp_server.py`) | ✅ Done | All code analysis tools, STDIO transport |
-| Analyzer Agent | ✅ Done | Connects to MCP, runs analysis, structured output via local tool |
+| Component                     | Status | Description |
+|-------------------------------|---|---|
+| MCP Server (`mcp_server.py`)  | ✅ Done | All code analysis tools, STDIO transport |
+| Analyzer Agent                | ✅ Done | Connects to MCP, runs analysis, structured output via local tool |
 | ChromaDB + `knowledge_search` | ✅ Done | RAG knowledge base populated and ready |
-| Enricher Agent | ✅ Done | Enriches findings with RAG context; batched to prevent context overflow |
-| Orchestrator | ✅ Done | Linear pipeline driver; owns pipeline state; builds per-agent input contracts |
-| Optimizer Agent | ✅ Done | Category-aware fix routing; Security/Logic/Maintainability processed individually, Style grouped by rule code |
-| Evaluator Agent | ✅ Done | LLM-as-Judge: judges each fix scoped to its anchor lines; derives one of 6 statuses (APPROVED / INCORRECT / INCOMPLETE / NONCOMPLIANT / NO_FIX / NOT_EVALUATED) in Python; produces markdown report |
-| Sandbox Executor | 🔲 Planned | Isolated execution to verify generated fixes (post-publish) |
+| Enricher Agent                | ✅ Done | Enriches findings with RAG context; batched to prevent context overflow |
+| Orchestrator                  | ✅ Done | Linear pipeline driver; owns pipeline state; builds per-agent input contracts |
+| Optimizer Agent               | ✅ Done | Category-aware fix routing; Security/Logic/Maintainability processed individually, Style grouped by rule code |
+| Evaluator Agent               | ✅ Done | LLM-as-Judge: judges each fix scoped to its anchor lines; derives one of 6 statuses (APPROVED / INCORRECT / INCOMPLETE / NONCOMPLIANT / NO_FIX / NOT_EVALUATED) in Python; produces markdown report |
+| Sandbox Executor              | 🔲 Planned | Isolated execution to verify generated fixes (post-publish) |
 
 ---
 
@@ -74,6 +74,7 @@ A single MCP server (`code-review-mcp`) exposes all tools. Agents discover tools
 | `read_code`                 | Read code from file path or raw string | `os.path.isfile()` routing, JSON output |
 | `detect_syntax_errors`      | Static analysis: code quality + security | ruff (E,F,W,C90,B rules) + bandit via subprocess |
 | `extract_code_structure`    | Extract functions, classes, imports | `ast.parse()` + `ast.walk()` |
+| `check_company_rules`       | Deterministic AST check against a company rule set | `ast.walk()` matched against `knowledge_base/company_rules.json` |
 | `knowledge_search`          | RAG search for best-practice context | ChromaDB cosine similarity, metadata category filter |
 | `generate_fix_suggestion`   | Extract enclosing function source for a finding line | AST walk, falls back to surrounding lines on syntax error or module-level code |
 
@@ -101,7 +102,9 @@ ChromaDB stores two types of Python best-practice documents in a single collecti
 **Google Python Style Guide (`pyguide`)** — covers naming conventions, imports, type annotations, exceptions, classes, and more. Goes beyond pure style into language patterns not caught by linters.
 Source: [google/styleguide](https://github.com/google/styleguide), license CC-BY 3.0.
 
-**example_company Code Standards (`company`)** — a set of fictional internal rules designed to demonstrate that the Enricher Agent retrieves knowledge from the database rather than relying on pre-trained knowledge. Rules include required function naming prefixes for database operations, mandatory `# REASON:` comments, a custom exception hierarchy, and restricted config access patterns.
+**example_company Code Standards (`company`)** — a set of fictional internal rules, checked deterministically via AST (`check_company_rules` MCP tool, Analyzer Agent) rather than by LLM judgment.   
+This knowledge base entry is used only by the Enricher Agent to retrieve rationale and context for a violation the Analyzer already found — never for detection itself.   
+Rules include required function naming prefixes for database operations, mandatory `# REASON:` comments, a custom exception hierarchy, and restricted config access patterns.
 
 Setup (run once after cloning):
 ```bash

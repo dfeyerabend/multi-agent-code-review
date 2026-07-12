@@ -75,26 +75,30 @@ def _assemble_analysis(mcp_outputs: dict, summary: str) -> dict:
 
     Args:
         mcp_outputs: Parsed JSON results keyed by MCP tool name
-                     ("read_code", "detect_syntax_errors", "extract_code_structure").
+                     ("read_code", "detect_syntax_errors", "extract_code_structure",
+                     "check_company_rules").
         summary:     The Analyzer's own factual summary from submit_analysis.
 
     Returns:
         dict with status "success" and "analysis_results"/"metadata" on success,
         or status "error" naming the missing or failed tool output. metadata
-        carries scan_complete (False if a scanner failed) and tool_errors.
+        carries scan_complete (False if a scanner or a company rule failed) and
+        tool_errors/company_rule_errors.
     """
     try:
         read_code_out = mcp_outputs.get("read_code")
         syntax_out = mcp_outputs.get("detect_syntax_errors")
         structure_out = mcp_outputs.get("extract_code_structure")
+        company_out = mcp_outputs.get("check_company_rules")
 
-        # All three are required inputs to the assembly — a missing one means the
+        # All four are required inputs to the assembly — a missing one means the
         # model never called that tool, which is a predictable agent failure, not a crash.
         missing = [
             name for name, out in [
                 ("read_code", read_code_out),
                 ("detect_syntax_errors", syntax_out),
                 ("extract_code_structure", structure_out),
+                ("check_company_rules", company_out),
             ] if out is None
         ]
         if missing:
@@ -127,12 +131,20 @@ def _assemble_analysis(mcp_outputs: dict, summary: str) -> dict:
         if tool_errors:
             logger.warning("_assemble_analysis: incomplete scan — tool_errors: %s", tool_errors)
 
+        # Company findings already arrive in final shape (lines/occurrences, message
+        # includes the function name) — no dedup pass needed or safe to apply here.
+        company_findings = company_out.get("findings", [])
+        company_rule_errors = company_out.get("rule_errors") or {}
+        if company_rule_errors:
+            logger.warning("_assemble_analysis: incomplete company-rule scan — rule_errors: %s", company_rule_errors)
+
         analysis_results = {
             "code": read_code_out["code"],
             "file_path": read_code_out.get("file_path"),
             "line_count": read_code_out["line_count"],
             "syntax_findings": _deduplicate_findings(ruff_findings),
             "security_findings": _deduplicate_findings(bandit_findings),
+            "company_findings": company_findings,
             "structure": {
                 "functions": structure_out.get("functions", []),
                 "classes": structure_out.get("classes", []),
@@ -147,12 +159,15 @@ def _assemble_analysis(mcp_outputs: dict, summary: str) -> dict:
             "metadata": {
                 "total_syntax_findings": len(analysis_results["syntax_findings"]),
                 "total_security_findings": len(analysis_results["security_findings"]),
+                "total_company_findings": len(analysis_results["company_findings"]),
                 "total_findings": (
                     len(analysis_results["syntax_findings"])
                     + len(analysis_results["security_findings"])
+                    + len(analysis_results["company_findings"])
                 ),
-                "scan_complete": not tool_errors,       # False when ruff or bandit failed
-                "tool_errors": tool_errors,             # empty dict when both scanners ran
+                "scan_complete": not tool_errors and not company_rule_errors,  # False if any scanner or rule failed
+                "tool_errors": tool_errors,                     # empty dict when both scanners ran
+                "company_rule_errors": company_rule_errors,     # empty dict when every company rule ran
             },
         }
 
@@ -194,21 +209,24 @@ async def run_analyzer(code_input: str) -> dict:
                 "line_count": 0,
                 "syntax_findings": [],
                 "security_findings": [],
+                "company_findings": [],
                 "structure": {"functions": [], "classes": [], "imports": []},
                 "summary": "No code provided.",
             },
             "metadata": {
                 "total_syntax_findings": 0,
                 "total_security_findings": 0,
+                "total_company_findings": 0,
                 "total_findings": 0,
                 "scan_complete": True,
                 "tool_errors": {},
+                "company_rule_errors": {},
             },
         }
 
     # Scanners receive the exact code captured from read_code, never the model's retyped
     # copy — a retyped string can be silently corrupted and make ruff/bandit scan the wrong code.
-    _CODE_ARG_TOOLS = {"detect_syntax_errors", "extract_code_structure"}
+    _CODE_ARG_TOOLS = {"detect_syntax_errors", "extract_code_structure", "check_company_rules"}
 
     try:
         server_params = StdioServerParameters(command="python", args=[MCP_SERVER_PATH])
@@ -338,9 +356,10 @@ if __name__ == "__main__":
         test_input = (
             "import os, sys\n"
             "import json\n"
-            "def get_user(id):\n"
+            "\n"
+            "def get_user(id, cache={}):  # REASON: demo function\n"
             "    query = 'SELECT * FROM users WHERE id = ' + id\n"
-            "    return query\n"
+            "    return db.execute(query)\n"
         )
 
     print("=" * 60)

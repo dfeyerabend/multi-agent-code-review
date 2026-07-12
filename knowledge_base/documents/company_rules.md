@@ -8,22 +8,23 @@ Violations of these rules must be flagged in every code review.
 
 ### 1.1 Database Function Naming Convention
 
-All functions that interact with a database must be prefixed with db_fetch_, db_save_,
-or db_delete_ depending on their operation. This makes data access points immediately
+Any function that accesses the database — that is, any function whose body calls
+`db.query`, `db.execute`, or `db.delete` — must be prefixed with db_fetch_, db_save_,
+or db_delete_ depending on its operation. This makes data access points immediately
 visible during code review and grep-searchable across the codebase.
 
 Allowed prefixes:
-- db_fetch_ — read operations (SELECT)
-- db_save_  — insert or update operations (INSERT, UPDATE)
-- db_delete_ — delete operations (DELETE)
+- db_fetch_ — read operations (SELECT), typically via db.query
+- db_save_  — insert or update operations (INSERT, UPDATE), typically via db.execute
+- db_delete_ — delete operations (DELETE), typically via db.delete
 
-BAD — violates example_company naming standard:
+BAD — accesses the database but is not prefixed:
 
     def get_user(user_id):
-        return db.query(f"SELECT * FROM users WHERE id = {user_id}")
+        return db.query("SELECT * FROM users WHERE id = ?", (user_id,))
 
     def user_save(data):
-        db.execute("INSERT INTO users VALUES (?)", data)
+        db.execute("INSERT INTO users VALUES (?)", (data,))
 
 GOOD — compliant with example_company naming standard:
 
@@ -36,12 +37,12 @@ GOOD — compliant with example_company naming standard:
 
 ---
 
-### 1.2 Required REASON Comment for Non-Trivial Functions
+### 1.2 Required REASON Comment
 
-Every non-trivial function must include a # REASON: inline comment on or directly
-below the def line. The comment must explain WHY the function exists, not what
-it does (that belongs in the docstring). This rule exists to prevent orphaned utility
-functions whose original purpose has been forgotten.
+Every function must include a # REASON: inline comment on the def line or directly
+below it. The comment must explain WHY the function exists, not what it does (that
+belongs in the docstring). This rule prevents orphaned utility functions whose
+original purpose has been forgotten.
 
 BAD — missing REASON comment:
 

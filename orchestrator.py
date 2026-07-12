@@ -173,7 +173,11 @@ async def run_pipeline(code_input: str, emit=None) -> dict:
         analysis = analyzer_result["analysis_results"]
         findings = [
             {k: v for k, v in f.items() if k in _ENRICHER_FIELDS}
-            for f in analysis.get("syntax_findings", []) + analysis.get("security_findings", [])
+            for f in (
+                    analysis.get("syntax_findings", [])
+                    + analysis.get("security_findings", [])
+                    + analysis.get("company_findings", [])
+            )
         ]
         trace.append(("Analyzer", len(findings)))
         _emit(f"Done in {render_report.format_duration(dur)}\n\n"
@@ -293,11 +297,23 @@ if __name__ == "__main__":
         test_input = sys.argv[1]
     else:
         test_input = (
-            "import os, sys\n"
-            "import json\n"
-            "def get_user(id):\n"
-            "    query = 'SELECT * FROM users WHERE id = ' + id\n"
+            "import os, sys\n"  # E401 (Style) + F401 x2 os/sys (Logic) — unused, multiple imports on one line
+            "import json\n"  # F401 json (Logic) — unused import
+            "\n"
+            "def get_user(id):  # REASON: fetch user record by id\n"  # REASON present -> COMPANY-1.2 does NOT fire on this function
+            "    query = 'SELECT * FROM users WHERE id = ' + id\n"  # B608 (Security, bandit) — SQL injection via string concatenation
             "    return query\n"
+            "\n"
+            "def calculate_total(a, b):\n"  # PURE case: no REASON comment, no other findings on this function at all
+            "    return a + b\n"  # -> expect exactly one finding: COMPANY-1.2 (Maintainability), isolated
+            "\n"
+            "def process_input(data):  # REASON: parse and validate raw input\n"  # REASON present -> COMPANY-1.2 does NOT fire on this function
+            "    try:\n"
+            "        return int(data)\n"
+            "    except ValueError:\n"
+            "        raise ValueError('invalid data')\n"
+        # COMBINED case, same line: ruff B904 raise-without-from-inside-except (Logic)
+            # + COMPANY-1.3 forbidden raise of built-in ValueError (Logic)
         )
 
     # emit prints each rendered block as it arrives — print lives in the entrypoint, never in
