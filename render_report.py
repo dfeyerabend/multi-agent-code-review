@@ -413,14 +413,19 @@ def render_analyzer_summary(analyzer_result: dict) -> str:
         analyzer_result: The Analyzer's result dict.
 
     Returns:
-        A Markdown table, plus a "scan incomplete" warning line when a scanner failed.
+        A Markdown table, plus a "scan incomplete" warning line when a scanner or a
+        company rule failed.
     """
     try:
         if not isinstance(analyzer_result, dict):
             return "_Analyzer summary unavailable (malformed result)._"
 
         analysis = analyzer_result.get("analysis_results", {})
-        findings = (analysis.get("syntax_findings") or []) + (analysis.get("security_findings") or [])
+        findings = (
+            (analysis.get("syntax_findings") or [])
+            + (analysis.get("security_findings") or [])
+            + (analysis.get("company_findings") or [])
+        )
 
         counts = {cat: 0 for cat in _CATEGORY_ORDER}
         extra = {}   # any category outside the known order still gets counted, never dropped
@@ -437,11 +442,14 @@ def render_analyzer_summary(analyzer_result: dict) -> str:
 
         parts = [_md_table(["Category", "Findings"], rows)]
 
-        # A failed scanner with zero findings must not look like clean code — surface it.
+        # A failed scanner or company rule with zero findings must not look like clean
+        # code — surface both error sources together, since either degrades scan_complete.
         meta = analyzer_result.get("metadata", {})
         if isinstance(meta, dict) and meta.get("scan_complete") is False:
             tool_errors = meta.get("tool_errors") or {}
-            detail = ", ".join(tool_errors.keys()) if isinstance(tool_errors, dict) and tool_errors else "unknown"
+            company_rule_errors = meta.get("company_rule_errors") or {}
+            failed = list(tool_errors.keys()) + list(company_rule_errors.keys())
+            detail = ", ".join(failed) if failed else "unknown"
             parts += ["", f"⚠️ scan incomplete — {detail} did not run cleanly; findings may be partial."]
 
         return "\n".join(parts)

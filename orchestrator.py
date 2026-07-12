@@ -173,7 +173,11 @@ async def run_pipeline(code_input: str, emit=None) -> dict:
         analysis = analyzer_result["analysis_results"]
         findings = [
             {k: v for k, v in f.items() if k in _ENRICHER_FIELDS}
-            for f in analysis.get("syntax_findings", []) + analysis.get("security_findings", [])
+            for f in (
+                    analysis.get("syntax_findings", [])
+                    + analysis.get("security_findings", [])
+                    + analysis.get("company_findings", [])
+            )
         ]
         trace.append(("Analyzer", len(findings)))
         _emit(f"Done in {render_report.format_duration(dur)}\n\n"

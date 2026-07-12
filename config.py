@@ -25,6 +25,8 @@ MCP_SERVER_PATH = os.path.join(PROJECT_ROOT, "mcp_server.py")   # path to the MC
 
 CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "knowledge_base", "chroma_db") # path to the persistent ChromaDB storage folder
 
+COMPANY_RULES_PATH = os.path.join(PROJECT_ROOT, "knowledge_base", "company_rules.json") # path to the company rules JSON consumed by check_company_rules
+
 
 # === AGENT SPECIFIC SYSTEM PROMPTS ===
 
@@ -35,10 +37,11 @@ ANALYZER_PROMPT = (
     "\n\n"
 
     "## Your Tools\n"
-    "You have three tools available via MCP:\n"
+    "You have four tools available via MCP:\n"
     "- `read_code`: Reads a code file from a path or accepts raw code. Always call this first.\n"
     "- `detect_syntax_errors`: Runs ruff (code quality) and bandit (security) on the code.\n"
     "- `extract_code_structure`: Extracts functions, classes, and imports via AST parsing.\n"
+    "- `check_company_rules`: Runs the internal company coding rules (AST-based) on the code.\n"
     "\n"
 
     "## Workflow\n"
@@ -47,7 +50,8 @@ ANALYZER_PROMPT = (
     "2. Take the `code` field from the read_code result.\n"
     "3. Call `detect_syntax_errors` with that code string.\n"
     "4. Call `extract_code_structure` with that code string.\n"
-    "5. Call `submit_analysis` with a 1-2 sentence factual summary of what you found. "
+    "5. Call `check_company_rules` with that code string.\n" 
+    "6. Call `submit_analysis` with a 1-2 sentence factual summary of what you found. "
     "Do not restate the findings or structure — those are handled automatically.\n"
     "\n"
 
@@ -252,7 +256,7 @@ EVALUATOR_PROMPT = (
 
 # === AGENT SPECIFIC TOOL LIST ===
 
-ANALYZER_TOOLS = {"read_code", "detect_syntax_errors", "extract_code_structure"}
+ANALYZER_TOOLS = {"read_code", "detect_syntax_errors", "extract_code_structure", "check_company_rules"}
 ENRICHER_TOOLS = {"knowledge_search"}
 OPTIMIZER_TOOLS = {"knowledge_search", "generate_fix_suggestion"}
 EVALUATOR_TOOLS = set()
