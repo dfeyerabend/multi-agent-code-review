@@ -30,7 +30,7 @@ def test_retrieves_db_naming_rule(chroma_collection):
         chroma_collection,
         query="function querying database without db_ prefix",
     )
-    assert any("company_1.1" in doc_id for doc_id in ids)
+    assert any("company_rules_1.1" in doc_id for doc_id in ids)
 
 
 def test_retrieves_reason_comment_rule(chroma_collection):
@@ -39,7 +39,7 @@ def test_retrieves_reason_comment_rule(chroma_collection):
         chroma_collection,
         query="function missing reason comment explaining its purpose",
     )
-    assert any("company_1.2" in doc_id for doc_id in ids)
+    assert any("company_rules_1.2" in doc_id for doc_id in ids)
 
 
 def test_retrieves_exception_hierarchy_rule(chroma_collection):
@@ -48,7 +48,7 @@ def test_retrieves_exception_hierarchy_rule(chroma_collection):
         chroma_collection,
         query="raising generic Exception instead of custom error class",
     )
-    assert any("company_1.3" in doc_id for doc_id in ids)
+    assert any("company_rules_1.3" in doc_id for doc_id in ids)
 
 
 def test_retrieves_config_access_rule(chroma_collection):
@@ -57,7 +57,7 @@ def test_retrieves_config_access_rule(chroma_collection):
         chroma_collection,
         query="direct os.environ access for reading configuration",
     )
-    assert any("company_1.4" in doc_id for doc_id in ids)
+    assert any("company_rules_1.4" in doc_id for doc_id in ids)
 
 
 # ── Metadata filtering ────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ def test_db_naming_rule_distance_within_threshold(chroma_collection):
     dist = _get_top_distance(
         chroma_collection,
         query="function querying database without db_ prefix",
-        expected_id_fragment="company_1.1",
+        expected_id_fragment="company_rules_1.1",
     )
     assert dist <= RAG_THRESHOLD, f"distance {dist:.4f} exceeds threshold {RAG_THRESHOLD}"
 
@@ -128,7 +128,7 @@ def test_reason_comment_rule_distance_within_threshold(chroma_collection):
     dist = _get_top_distance(
         chroma_collection,
         query="function missing reason comment explaining its purpose",
-        expected_id_fragment="company_1.2",
+        expected_id_fragment="company_rules_1.2",
     )
     assert dist <= RAG_THRESHOLD, f"distance {dist:.4f} exceeds threshold {RAG_THRESHOLD}"
 
@@ -138,7 +138,7 @@ def test_exception_hierarchy_rule_distance_within_threshold(chroma_collection):
     dist = _get_top_distance(
         chroma_collection,
         query="raising generic Exception instead of custom error class",
-        expected_id_fragment="company_1.3",
+        expected_id_fragment="company_rules_1.3",
     )
     assert dist <= RAG_THRESHOLD, f"distance {dist:.4f} exceeds threshold {RAG_THRESHOLD}"
 
@@ -148,6 +148,6 @@ def test_config_access_rule_distance_within_threshold(chroma_collection):
     dist = _get_top_distance(
         chroma_collection,
         query="direct os.environ access for reading configuration",
-        expected_id_fragment="company_1.4",
+        expected_id_fragment="company_rules_1.4",
     )
     assert dist <= RAG_THRESHOLD, f"distance {dist:.4f} exceeds threshold {RAG_THRESHOLD}"
