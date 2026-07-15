@@ -4,6 +4,19 @@
 
 ---
 
+## 🚀 Try It
+
+**Live demo:** deploying to Railway, link coming soon.
+
+The project ships a browser UI (`app.py`, built with Gradio) that streams the four agent stages live and renders the final report. It bundles a ready to run example (click **Load example code**), plus two explainer panels: one walks through the example and the issues it contains, the other explains how to read the report.
+
+Run it locally after completing the one time setup in [Getting Started](#getting-started):
+
+```bash
+python app.py
+# then open http://localhost:7860 in your browser
+```
+
 ## What This Is
 
 An automated code review system where specialized agents work in sequence:
