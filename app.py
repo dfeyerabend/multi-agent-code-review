@@ -655,7 +655,7 @@ footer {
 
 # === UI ASSEMBLY ===
 
-with gr.Blocks(title="Multi-Agent Code Review", css=custom_css) as demo:
+with gr.Blocks(title="Multi-Agent Code Review") as demo:
 
     # Per-session stores: the current report markdown, and the last temp file path for cleanup.
     report_state = gr.State(value="")
@@ -785,4 +785,4 @@ if __name__ == "__main__":
 
     # Hosts such as Railway inject the public port via $PORT; fall back to Gradio's default for local runs. Binding 0.0.0.0 makes the server reachable from outside the container.
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    demo.launch(server_name="0.0.0.0", server_port=port, css=custom_css)
