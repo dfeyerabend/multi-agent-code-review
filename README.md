@@ -252,7 +252,7 @@ python -m venv .venv
 source .venv/bin/activate       # macOS/Linux
 .venv\Scripts\activate          # Windows
 
-pip install -r requirements.txt
+pip install -r requirements.txt.txt
 
 # Populate the RAG knowledge base (downloads embedding model on first run, ~90 MB)
 python knowledge_base/create_database.py

@@ -1,0 +1,20 @@
+# Direct dependencies only. Everything else (gradio-client, starlette, fastapi,
+# numpy, onnxruntime, uvicorn, ...) is resolved by pip so versions always stay
+# mutually compatible with the pins below.
+
+# Web UI (6.10 renders gr.Code correctly; 6.20 does not)
+gradio==6.10.0
+
+# LLM client + MCP tool transport
+anthropic==0.86.0
+mcp==1.26.0
+
+# RAG knowledge base (pulls in onnxruntime + numpy)
+chromadb==1.5.8
+
+# Static analysis tools the MCP server shells out to
+ruff==0.15.7
+bandit==1.9.4
+
+# Env loading
+python-dotenv==1.2.2
