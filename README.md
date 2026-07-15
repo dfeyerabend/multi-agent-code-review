@@ -6,11 +6,11 @@
 
 ## 🚀 Try It
 
-**Live demo:** deploying to Railway, link coming soon.
+### [▶ Open the live demo](https://multi-agent-code-review-production.up.railway.app)
 
-The project ships a browser UI (`app.py`, built with Gradio) that streams the four agent stages live and renders the final report. It bundles a ready to run example (click **Load example code**), plus two explainer panels: one walks through the example and the issues it contains, the other explains how to read the report.
+No setup required: paste Python code or click **Load example code**, then **Run review** to watch the four agent stages stream live and produce a report.
 
-Run it locally after completing the one time setup in [Getting Started](#getting-started):
+Prefer to run it yourself? After the setup in [Getting Started](#getting-started):
 
 ```bash
 python app.py
